@@ -1,5 +1,3 @@
-# /vllm/benchmarks/multi_turn/benchmark_serving_multi_turn.py
-
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
@@ -58,8 +56,6 @@ class ClientArgs(NamedTuple):
     conversation_sampling: ConversationSampling
     request_rate: float
     max_retries: int
-    # NOTE, hyunnnchoi, 2026.01.26: Added for pre-request context length check
-    max_context_tokens: int | None
 
 
 class RequestArgs(NamedTuple):
@@ -69,8 +65,6 @@ class RequestArgs(NamedTuple):
     limit_min_tokens: int  # Use negative value for no limit
     limit_max_tokens: int  # Use negative value for no limit
     timeout_sec: int
-    temperature: float
-    repetition_penalty: float
 
 
 class BenchmarkArgs(NamedTuple):
@@ -222,16 +216,13 @@ async def send_request(
     stream: bool = True,
     min_tokens: int | None = None,
     max_tokens: int | None = None,
-    timeout_sec: int = 120000,
-    temperature: float = 0.0,
-    repetition_penalty: float = 1.0,
+    timeout_sec: int = 12000,
 ) -> ServerResponse:
     payload = {
         "model": model,
         "messages": messages,
         "seed": 0,
-        "temperature": temperature,
-        "repetition_penalty": repetition_penalty,
+        "temperature": 0.0,
     }
 
     if stream:
@@ -428,8 +419,6 @@ async def send_turn(
         min_tokens,
         max_tokens,
         req_args.timeout_sec,
-        req_args.temperature,
-        req_args.repetition_penalty,
     )
 
     if response.valid is False:
@@ -521,16 +510,9 @@ async def send_turn(
 
         # Update the answer
         conversation_messages[answer_index]["content"] = output_content
-        # NOTE, hyunnnchoi, 2026.01.26: Record output_tokens for reproducibility
-        conversation_messages[answer_index]["output_tokens"] = output_num_tokens
     else:
         # A user prompt that has no answer, add the answer as a new message
-        # NOTE, hyunnnchoi, 2026.01.26: Include output_tokens for reproducibility
-        new_answer = {
-            "role": "assistant",
-            "content": output_content,
-            "output_tokens": output_num_tokens,
-        }
+        new_answer = {"role": "assistant", "content": output_content}
         conversation_messages.append(new_answer)
 
     return rs
@@ -696,28 +678,6 @@ async def client_main(
                 )
                 time_of_last_turn[conv_id] = curr_time_sec
 
-            # NOTE, hyunnnchoi, 2026.01.26: Pre-request context length check
-            # to avoid server-side rejections and ensure reproducibility
-            if args.max_context_tokens is not None:
-                input_tokens = get_messages_token_count(
-                    tokenizer, messages[:current_turn]
-                )
-                if input_tokens > args.max_context_tokens:
-                    logger.info(
-                        f"{Color.YELLOW}Client {client_id} - Conversation {conv_id} "
-                        f"reached {input_tokens} tokens at turn {current_turn}, "
-                        f"exceeds limit {args.max_context_tokens}. "
-                        f"Ending conversation gracefully.{Color.RESET}"
-                    )
-                    # Save conversation up to the last successful assistant turn
-                    messages_to_save = messages[:]
-                    if messages_to_save and messages_to_save[-1]["role"] == "user":
-                        messages_to_save = messages_to_save[:-1]
-                    if messages_to_save:
-                        conv_queue.put((conv_id, messages_to_save))
-                    active_convs.pop(conv_id)
-                    continue
-
             success = False
             for attempt_cnt in range(args.max_retries + 1):
                 try:
@@ -768,20 +728,8 @@ async def client_main(
 
             if not success:
                 num_failures += 1
-                # NOTE, hyunnnchoi, 2026.01.26: Save conversation up to the last
-                # successful assistant turn for reproducibility
-                messages_to_save = active_convs.pop(conv_id)
-                # Remove trailing user message (failed turn) if present
-                if messages_to_save and messages_to_save[-1]["role"] == "user":
-                    messages_to_save = messages_to_save[:-1]
-                if messages_to_save:
-                    conv_queue.put((conv_id, messages_to_save))
-                    if args.verbose:
-                        logger.info(
-                            f"{Color.YELLOW}Client {client_id} - Saved partial "
-                            f"conversation {conv_id} with {len(messages_to_save)} "
-                            f"messages{Color.RESET}"
-                        )
+                # Remove the conversation (should not be used again)
+                active_convs.pop(conv_id)
                 if exception:
                     break  # Exit gracefully instead of raising an error
 
@@ -901,8 +849,6 @@ def get_client_config(
         conversation_sampling=args.conversation_sampling,
         request_rate=args.request_rate,
         max_retries=args.max_retries,
-        # NOTE, hyunnnchoi, 2026.01.26: Added for pre-request context length check
-        max_context_tokens=args.max_context_tokens,
     )
 
     if args.limit_min_tokens > 0 or args.limit_max_tokens > 0:
@@ -929,8 +875,6 @@ def get_client_config(
         limit_min_tokens=args.limit_min_tokens,
         limit_max_tokens=args.limit_max_tokens,
         timeout_sec=args.request_timeout_sec,
-        temperature=args.temperature,
-        repetition_penalty=args.repetition_penalty,
     )
 
     return client_args, req_args
@@ -1456,17 +1400,6 @@ async def main() -> None:
         "fair workload distribution. "
         "Can also be set via MULTITURN_BENCH_MAX_RETRIES environment variable.",
     )
-    # NOTE, hyunnnchoi, 2026.01.26: Added for pre-request context length check
-    parser.add_argument(
-        "--max-context-tokens",
-        type=int,
-        default=None,
-        help="Maximum context length (in tokens) allowed before sending a request. "
-        "If the input context exceeds this limit, the conversation is gracefully "
-        "terminated and saved up to the last successful turn. "
-        "Recommended to set slightly below the model's max_model_len "
-        "(e.g., 60000 for a 65536 limit) to avoid server-side rejections.",
-    )
     parser.add_argument(
         "--conversation-sampling",
         type=ConversationSampling,
@@ -1487,7 +1420,7 @@ async def main() -> None:
     parser.add_argument(
         "--request-timeout-sec",
         type=int,
-        default=120000,
+        default=12000,
         help="Timeout in seconds for each API request (default: 120). "
         "Automatically increased if max tokens imply longer decoding.",
     )
@@ -1497,19 +1430,6 @@ async def main() -> None:
         default=False,
         action="store_true",
         help="Disable stream/streaming mode (set 'stream' to False in the API request)",
-    )
-
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Temperature for sampling (default: 0.0)",
-    )
-    parser.add_argument(
-        "--repetition-penalty",
-        type=float,
-        default=1.0,
-        help="Repetition penalty (default: 1.0)",
     )
 
     parser.add_argument(

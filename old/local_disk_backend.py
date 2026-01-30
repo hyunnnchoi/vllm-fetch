@@ -1,14 +1,12 @@
 # /lmcache/lmcache/v1/storage_backend/local_disk_backend.py
-
-# Dongdongju fix
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from concurrent.futures import Future
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
 import os
 import threading
 import time
-from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 
 # Third Party
 import torch
@@ -155,7 +153,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
-        self.usage = 0.0
+        self.usage = 0
 
         # Batched message sender for controller communication
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
@@ -222,97 +220,23 @@ class LocalDiskBackend(StorageBackendInterface):
             else:
                 return False
 
-    def _invalidate_key_no_file(
-        self,
-        key: CacheEngineKey,
-        reason: str,
-        expected_path: Optional[str] = None,
-    ) -> bool:
-        """
-        Invalidate a stale metadata entry whose disk file is missing.
-
-        This centralizes cleanup so the metadata dict, eviction policy state,
-        and size accounting remain consistent.
-        """
-        meta: Optional[DiskCacheMetadata]
-        with self.disk_lock:
-            meta = self.dict.pop(key, None)
-            if meta is None:
-                return False
-
-            # Keep policy state consistent (especially LFU).
-            self.cache_policy.update_on_force_evict(key)
-
-            # Clean up request-local bookkeeping that can later call update_on_hit.
-            if self.keys_in_request:
-                self.keys_in_request = [k for k in self.keys_in_request if k != key]
-
-            # Keep accounting consistent and non-negative.
-            self.usage = max(0.0, self.usage - meta.size)
-            self.current_cache_size = max(0.0, self.current_cache_size - meta.size)
-            self.stats_monitor.update_local_storage_usage(self.usage)
-
-        # Best-effort disk cleanup outside the lock.
-        cleanup_path = expected_path or meta.path
-        try:
-            os.remove(cleanup_path)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            logger.debug(
-                f"Failed to remove stale disk cache file {cleanup_path}: {exc}"
-            )
-
-        # Clean up any in-flight put task tracking for this key.
-        if self.exists_in_put_tasks(key):
-            self.disk_worker.remove_put_task(key)
-
-        logger.warning(
-            "Invalidated disk cache key %s due to missing file (%s): %s",
-            key,
-            reason,
-            cleanup_path,
-        )
-
-        # Notify controller that the KV is no longer present on disk.
-        if self.batched_msg_sender is not None:
-            self.batched_msg_sender.add_kv_op(
-                op_type=OpType.EVICT,
-                key=key.chunk_hash,
-            )
-
-        return True
-
     def remove(
         self,
         key: CacheEngineKey,
         force: bool = True,
     ) -> bool:
-        lock_acquired = False
         if force:
             self.disk_lock.acquire()
-            lock_acquired = True
 
-        try:
-            meta = self.dict.pop(key, None)
-            if meta is None:
-                return False
-
-            path = meta.path
-            size = meta.size
-
-            # Ensure policy state and request-local bookkeeping stay consistent.
-            self.cache_policy.update_on_force_evict(key)
-            if self.keys_in_request:
-                self.keys_in_request = [k for k in self.keys_in_request if k != key]
-
-            # Keep accounting consistent and non-negative.
-            self.usage = max(0.0, self.usage - size)
-            self.current_cache_size = max(0.0, self.current_cache_size - size)
-            self.stats_monitor.update_local_storage_usage(self.usage)
-        finally:
-            if lock_acquired:
+        if not (meta := self.dict.pop(key, None)):
+            if force:
                 self.disk_lock.release()
+            return False
+
+        path = meta.path
+        size = meta.size
+        self.usage -= size
+        self.stats_monitor.update_local_storage_usage(self.usage)
 
         # NOTE: The following code will cause deadlock
         # res = asyncio.run_coroutine_threadsafe(
@@ -321,11 +245,11 @@ class LocalDiskBackend(StorageBackendInterface):
         # )
         # res.result()
 
-        # The file might already be gone due to races; treat as idempotent.
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            logger.debug(f"Disk cache file already removed: {path}")
+        os.remove(path)
+
+        if force:
+            self.cache_policy.update_on_force_evict(key)
+            self.disk_lock.release()
 
         # Push kv evict msg with batching
         if self.batched_msg_sender is not None:
@@ -369,17 +293,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ):
-        """
-        Submit a single put task to store KV cache to disk asynchronously.
-
-        :param key: The cache key for this KV chunk.
-        :param memory_obj: The memory object containing the KV data.
-        :param on_complete_callback: Optional callback invoked once per key
-            after the disk write completes. Callback exceptions are caught
-            and logged.
-        """
         assert memory_obj.tensor is not None
 
         # skip repeated save
@@ -405,6 +319,9 @@ class LocalDiskBackend(StorageBackendInterface):
                     evict_success = False
                     break
 
+                for evict_key in evict_keys:
+                    self.current_cache_size -= self.dict[evict_key].size
+
                 self.batched_remove(evict_keys, force=False)
 
                 all_evict_keys.extend(evict_keys)
@@ -423,7 +340,6 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.async_save_bytes_to_disk,
                 key=key,
                 memory_obj=memory_obj,
-                on_complete_callback=on_complete_callback,
             ),
             self.loop,
         )
@@ -434,22 +350,9 @@ class LocalDiskBackend(StorageBackendInterface):
         keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
-        """
-        Submit batched put tasks to store KV caches to disk asynchronously.
-
-        :param keys: The cache keys for the KV chunks.
-        :param memory_objs: The memory objects containing the KV data.
-        :param transfer_spec: Optional transfer specification (unused).
-        :param on_complete_callback: Optional callback invoked once per key
-            after that key's disk write completes (not once per batch).
-            Callback exceptions are caught and logged.
-        """
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
-            )
+            self.submit_put_task(key, memory_obj)
 
     def get_blocking(
         self,
@@ -556,14 +459,9 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         """
         Convert KV to bytes and async store bytes to disk.
-
-        :param on_complete_callback: Optional callback invoked after the disk
-            write completes for this key. Callback exceptions are caught and
-            logged.
         """
         kv_chunk = memory_obj.tensor
         assert kv_chunk is not None
@@ -592,15 +490,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
 
-        if self.exists_in_put_tasks(key):
-            self.disk_worker.remove_put_task(key)
-
-        # Call the completion callback if provided
-        if on_complete_callback is not None:
-            try:
-                on_complete_callback(key)
-            except Exception as e:
-                logger.warning(f"on_complete_callback failed for key {key}: {e}")
+        self.disk_worker.remove_put_task(key)
 
     def batched_async_load_bytes_from_disk(
         self,
@@ -614,59 +504,28 @@ class LocalDiskBackend(StorageBackendInterface):
         """
 
         logger.debug("Executing `async_load_bytes` from disk.")
-        snapshots: list[
-            tuple[CacheEngineKey, DiskCacheMetadata, str, Optional[torch.Tensor]]
-        ] = []
-        with self.disk_lock:
-            for idx, key in enumerate(keys):
-                meta = self.dict.get(key)
-                if meta is None:
-                    logger.debug(
-                        "Disk prefetch metadata missing before I/O for key: %s", key
-                    )
-                    # Best-effort unpin for keys that were pinned earlier.
-                    for snap_key, snap_meta, _snap_path, _snap_pos in snapshots:
-                        snap_meta.unpin()
-                    for remaining_key in keys[idx:]:
-                        remaining_meta = self.dict.get(remaining_key)
-                        if remaining_meta is not None:
-                            remaining_meta.unpin()
-                    return []
-                cached_positions = meta.cached_positions
-                if isinstance(cached_positions, torch.Tensor):
-                    cached_positions = cached_positions.clone()
-                snapshots.append((key, meta, meta.path, cached_positions))
-
-        loaded_mem_objs: list[MemoryObj] = []
-        for idx, (snap_key, snap_meta, snapshot_path, cached_positions) in enumerate(
-            snapshots
-        ):
-            mem_obj = memory_objs[idx]
+        # TODO (Jiayi): handle the case where loading fails.
+        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             buffer = mem_obj.byte_array
-            try:
-                self.read_file(snap_key, buffer, snapshot_path)
-            except FileNotFoundError:
-                # Treat as cache miss and invalidate stale metadata.
-                self._invalidate_key_no_file(
-                    snap_key,
-                    reason="batched prefetch read encountered missing file",
-                    expected_path=snapshot_path,
-                )
+            # NOTE, hyunnnchoi, 2026.01.16: Added check for read_file failure to avoid KeyError
+            if not self.read_file(key, buffer, path):
+                continue
 
-                # Unpin the remaining keys in this batch and stop at the gap.
-                with self.disk_lock:
-                    for _rem_key, rem_meta, _rem_path, _rem_pos in snapshots[idx:]:
-                        rem_meta.unpin()
-                break
+            # TODO(Jiayi): Please recover the metadata in a more
+            # elegant way in the future.
+            # NOTE, hyunnnchoi, 2026.01.16: Safely get from dict to avoid KeyError
+            disk_meta = self.dict.get(key)
+            if disk_meta is not None:
+                cached_positions = disk_meta.cached_positions
+                mem_obj.metadata.cached_positions = cached_positions
 
-            mem_obj.metadata.cached_positions = cached_positions
+                self.disk_lock.acquire()
+                # Double check if the key is still in the dict before unpinning
+                if key in self.dict:
+                    self.dict[key].unpin()
+                self.disk_lock.release()
 
-            with self.disk_lock:
-                snap_meta.unpin()
-
-            loaded_mem_objs.append(mem_obj)
-
-        return loaded_mem_objs
+        return memory_objs
 
     def load_bytes_from_disk(
         self,
@@ -679,38 +538,22 @@ class LocalDiskBackend(StorageBackendInterface):
         """
         Load bytearray from disk.
         """
-        # Snapshot metadata under lock and avoid re-reading self.dict after I/O.
-        with self.disk_lock:
-            meta = self.dict.get(key)
-            if meta is None:
-                return None
-            snapshot_path = meta.path or path
-            cached_positions = meta.cached_positions
-            if isinstance(cached_positions, torch.Tensor):
-                cached_positions = cached_positions.clone()
 
-            snapshot_dtype = meta.dtype or dtype
-            snapshot_shape = meta.shape or shape
-            snapshot_fmt = meta.fmt or fmt
-
-        memory_obj = self.local_cpu_backend.allocate(
-            snapshot_shape, snapshot_dtype, snapshot_fmt
-        )
+        memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        try:
-            self.read_file(key, buffer, snapshot_path)
-        except FileNotFoundError:
-            # Treat as cache miss, invalidate stale metadata, and release allocation.
-            self._invalidate_key_no_file(
-                key,
-                reason="blocking disk read encountered missing file",
-                expected_path=snapshot_path,
-            )
-            memory_obj.ref_count_down()
+        # NOTE, hyunnnchoi, 2026.01.16: Added check for read_file failure to avoid KeyError
+        if not self.read_file(key, buffer, path):
             return None
 
+        # TODO(Jiayi): Please recover the metadata in a more
+        # elegant way in the future.
+        # NOTE, hyunnnchoi, 2026.01.16: Safely get from dict to avoid KeyError
+        disk_meta = self.dict.get(key)
+        if disk_meta is None:
+            return None
+        cached_positions = disk_meta.cached_positions
         memory_obj.metadata.cached_positions = cached_positions
 
         return memory_obj
@@ -731,7 +574,7 @@ class LocalDiskBackend(StorageBackendInterface):
             f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
         )
 
-    def read_file(self, key, buffer, path):
+    def read_file(self, key, buffer, path) -> bool:
         start_time = time.time()
         size = len(buffer)
         fblock_aligned = size % self.os_disk_bs == 0
@@ -751,13 +594,16 @@ class LocalDiskBackend(StorageBackendInterface):
                     fdo.readinto(buffer)
         except FileNotFoundError:
             logger.warning(f"File not found on disk: {path}")
-            raise
+            if self.dict.get(key, None):
+                self.dict.pop(key)
+            return False
 
         disk_read_time = time.time() - start_time
         logger.debug(
             f"Disk read size: {size} bytes, "
             f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
         )
+        return True
 
     def get_allocator_backend(self):
         return self.local_cpu_backend

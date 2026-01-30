@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -35,7 +36,6 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import SchedulerInterface
-
 # NOTE, hyunnnchoi, 2026.01.08
 # Import SchedulerLogger for detailed scheduler logging
 from vllm.v1.core.sched.logger import SchedulerLogger, WaitingReason
@@ -58,8 +58,6 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
-
-from vllm import envs
 
 logger = init_logger(__name__)
 
@@ -443,8 +441,6 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
-        # NOTE, hyunnnchoi, 2026.01.29
-        # If there are preempted requests, don't schedule new waiting requests
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -468,11 +464,6 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id,
                         )
-                        # NOTE, hyunnnchoi, 2026.01.29
-                        # Mark waiting reason for remote KV transfer
-                        self.scheduler_logger.set_waiting_reason(
-                            request.request_id, WaitingReason.WAITING_FOR_REMOTE_KVS
-                        )
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
@@ -484,11 +475,6 @@ class Scheduler(SchedulerInterface):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
-                        # NOTE, hyunnnchoi, 2026.01.29
-                        # Mark waiting reason for FSM compilation
-                        self.scheduler_logger.set_waiting_reason(
-                            request.request_id, WaitingReason.WAITING_FOR_FSM
-                        )
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
@@ -504,11 +490,6 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    # NOTE, hyunnnchoi, 2026.01.29
-                    # Mark waiting reason for max LoRAs exceeded
-                    self.scheduler_logger.set_waiting_reason(
-                        request.request_id, WaitingReason.MAX_LORAS_EXCEEDED
-                    )
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -535,12 +516,6 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            # NOTE, hyunnnchoi, 2026.01.29
-                            # Mark waiting reason for KV connector unavailability
-                            self.scheduler_logger.set_waiting_reason(
-                                request.request_id,
-                                WaitingReason.KV_CONNECTOR_UNAVAILABLE,
-                            )
                             self.waiting.pop_request()
                             skipped_waiting_requests.prepend_request(request)
                             continue
@@ -609,12 +584,6 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
-                            # NOTE, hyunnnchoi, 2026.01.29
-                            # Mark waiting reason for encoder budget exhaustion
-                            self.scheduler_logger.set_waiting_reason(
-                                request.request_id,
-                                WaitingReason.ENCODER_BUDGET_EXHAUSTED,
-                            )
                             break
 
                 # Handles an edge case when P/D Disaggregation
@@ -723,12 +692,14 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
-        else:
-            # NOTE, hyunnnchoi, 2026.01.29
-            # If preempted requests exist, mark all waiting requests as blocked
+
+        # NOTE, hyunnnchoi, 2026.01.28
+        # If while loop ended due to token_budget exhaustion, mark remaining
+        # waiting requests as blocked by MAX_NUM_BATCHED_TOKENS (HOL blocking)
+        if self.waiting and token_budget <= 0:
             for req in self.waiting:
                 self.scheduler_logger.set_waiting_reason(
-                    req.request_id, WaitingReason.BLOCKED_BY_PREEMPTION
+                    req.request_id, WaitingReason.MAX_NUM_BATCHED_TOKENS
                 )
 
         # Put back any skipped requests at the head of the waiting queue
@@ -839,9 +810,7 @@ class Scheduler(SchedulerInterface):
 
         # Calculate KV cache usage
         kv_cache_total = self.kv_cache_manager.block_pool.num_gpu_blocks
-        kv_cache_used = (
-            kv_cache_total - self.kv_cache_manager.block_pool.get_num_free_blocks()
-        )
+        kv_cache_used = kv_cache_total - self.kv_cache_manager.block_pool.get_num_free_blocks()
 
         # Determine scheduler action
         scheduler_action = "continue"
@@ -857,10 +826,7 @@ class Scheduler(SchedulerInterface):
             if request:
                 # Simple heuristic: if num_computed_tokens < num_prompt_tokens, it's prefill
                 if request.num_computed_tokens < request.num_prompt_tokens:
-                    prefill_tokens = min(
-                        num_tokens,
-                        request.num_prompt_tokens - request.num_computed_tokens,
-                    )
+                    prefill_tokens = min(num_tokens, request.num_prompt_tokens - request.num_computed_tokens)
                     decode_tokens = num_tokens - prefill_tokens
                 else:
                     prefill_tokens = 0
@@ -874,7 +840,7 @@ class Scheduler(SchedulerInterface):
                     self.scheduler_logger.update_kv_cache_blocks(
                         req_id, num_blocks, self.block_size
                     )
-                if hasattr(request, "priority"):
+                if hasattr(request, 'priority'):
                     self.scheduler_logger.update_priority(req_id, request.priority)
 
         self.scheduler_logger.end_iteration(
@@ -1200,10 +1166,6 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        # NOTE, hyunnnchoi, 2026.01.26
-        # Output processing 시작 시점 기록 (forward_pass_duration 계산에 사용)
-        self.scheduler_logger.record_output_begin()
-
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1433,7 +1395,7 @@ class Scheduler(SchedulerInterface):
 
         # NOTE, hyunnnchoi, 2026.01.08
         # Track if this is the first output token for TTFT
-        is_first_token = request.num_output_tokens == 0 and len(new_token_ids) > 0
+        is_first_token = (request.num_output_tokens == 0 and len(new_token_ids) > 0)
 
         for num_new, output_token_id in enumerate(new_token_ids, 1):
             request.append_output_token_ids(output_token_id)
@@ -1454,7 +1416,8 @@ class Scheduler(SchedulerInterface):
         # Log request completion
         if stopped:
             self.scheduler_logger.record_request_completed(
-                request.request_id, request.num_output_tokens
+                request.request_id,
+                request.num_output_tokens
             )
 
         return new_token_ids, stopped

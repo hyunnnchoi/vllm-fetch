@@ -1,5 +1,4 @@
 # /vllm/vllm/v1/core/sched/logger.py
-
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -24,37 +23,22 @@ logger = init_logger(__name__)
 
 class WaitingReason(Enum):
     """Request가 waiting 상태일 때의 원인"""
-
-    # Scheduling constraints
     MAX_NUM_SEQS = "max_num_seqs"
     MAX_NUM_BATCHED_TOKENS = "max_num_batched_tokens"
     MEMORY_INSUFFICIENT = "memory_insufficient"
     CONTEXT_LENGTH_LIMIT = "context_length_limit"
     DECODE_PRIORITY = "decode_priority"
     CHUNKED_PREFILL = "chunked_prefill"
-
-    # State-based waiting
     PREEMPTED = "preempted"
     EVICTED = "evicted"
     RECOMPUTATION = "recomputation"
     INITIAL_WAITING = "initial_waiting"
-
-    # NOTE, hyunnnchoi, 2026.01.29
-    # KV Transfer 및 특수 케이스
-    WAITING_FOR_REMOTE_KVS = "waiting_for_remote_kvs"
-    WAITING_FOR_FSM = "waiting_for_fsm"
-    MAX_LORAS_EXCEEDED = "max_loras_exceeded"
-    KV_CONNECTOR_UNAVAILABLE = "kv_connector_unavailable"
-    ENCODER_BUDGET_EXHAUSTED = "encoder_budget_exhausted"
-    BLOCKED_BY_PREEMPTION = "blocked_by_preemption"
-
     UNKNOWN = "unknown"
 
 
 @dataclass
 class RequestMetrics:
     """Request별 메트릭을 추적하는 데이터 클래스"""
-
     request_id: str
     arrival_time: int  # nanosecond
     input_token_count: int
@@ -92,19 +76,11 @@ class RequestMetrics:
 @dataclass
 class IterationMetrics:
     """Iteration별 메트릭"""
-
     iteration_id: int
     iteration_start_time: int
     iteration_end_time: int = 0
     iteration_duration: int = 0
     scheduling_overhead: int = 0
-
-    # NOTE, hyunnnchoi, 2026.01.26
-    # Forward pass와 output processing 시간 breakdown
-    # forward_pass_duration: schedule() 종료 ~ update_from_output() 시작
-    # output_processing_duration: update_from_output() 시작 ~ 다음 begin_iteration()
-    forward_pass_duration: int = 0
-    output_processing_duration: int = 0
 
     # Batch information
     batch_size: int = 0
@@ -130,7 +106,6 @@ class IterationMetrics:
 @dataclass
 class RequestStateInIteration:
     """각 iteration에서 request의 상태"""
-
     iteration_id: int
     request_id: str
     state: str
@@ -144,7 +119,6 @@ class RequestStateInIteration:
 @dataclass
 class SchedulerEvent:
     """스케줄러 이벤트"""
-
     timestamp: int
     event_type: str
     request_id: str
@@ -196,13 +170,6 @@ class SchedulerLogger:
         self.current_iteration_id = 0
         self.current_iteration_metrics: Optional[IterationMetrics] = None
 
-        # NOTE, hyunnnchoi, 2026.01.26
-        # Forward pass / Output processing 시간 측정을 위한 타임스탬프
-        # _prev_iteration_end_time: 이전 iteration의 end_iteration() 호출 시점
-        # _output_begin_time: 현재 iteration의 update_from_output() 시작 시점
-        self._prev_iteration_end_time: int = 0
-        self._output_begin_time: int = 0
-
         # CSV 파일 초기화
         self._init_csv_files()
 
@@ -213,92 +180,46 @@ class SchedulerLogger:
         # per_request.csv
         self.per_request_file = open(self.log_dir / "per_request.csv", "w", newline="")
         self.per_request_writer = csv.writer(self.per_request_file)
-        self.per_request_writer.writerow(
-            [
-                "request_id",
-                "arrival_time",
-                "first_scheduled_time",
-                "completion_time",
-                "waiting_time",
-                "execution_time",
-                "e2e_latency",
-                "input_tokens",
-                "output_tokens",
-                "ttft",
-                "tpot",
-                "throughput",
-                "preemption_count",
-                "eviction_count",
-                "kv_cache_blocks",
-                "kv_cache_memory_bytes",
-                "priority_score",
-            ]
-        )
+        self.per_request_writer.writerow([
+            "request_id", "arrival_time", "first_scheduled_time", "completion_time",
+            "waiting_time", "execution_time", "e2e_latency", "input_tokens",
+            "output_tokens", "ttft", "tpot", "throughput", "preemption_count",
+            "eviction_count", "kv_cache_blocks", "kv_cache_memory_bytes", "priority_score"
+        ])
 
         # state_transitions.csv (별도 파일로 출력)
-        self.state_transitions_file = open(
-            self.log_dir / "state_transitions.csv", "w", newline=""
-        )
+        self.state_transitions_file = open(self.log_dir / "state_transitions.csv", "w", newline="")
         self.state_transitions_writer = csv.writer(self.state_transitions_file)
-        self.state_transitions_writer.writerow(
-            ["request_id", "timestamp", "state", "duration_in_prev_state"]
-        )
+        self.state_transitions_writer.writerow([
+            "request_id", "timestamp", "state", "duration_in_prev_state"
+        ])
 
         # per_iteration.csv
-        # NOTE, hyunnnchoi, 2026.01.26
-        # forward_pass_duration, output_processing_duration 컬럼 추가
-        self.per_iteration_file = open(
-            self.log_dir / "per_iteration.csv", "w", newline=""
-        )
+        self.per_iteration_file = open(self.log_dir / "per_iteration.csv", "w", newline="")
         self.per_iteration_writer = csv.writer(self.per_iteration_file)
-        self.per_iteration_writer.writerow(
-            [
-                "iteration_id",
-                "start_time",
-                "end_time",
-                "duration",
-                "scheduling_overhead",
-                "forward_pass_duration",
-                "output_processing_duration",
-                "batch_size",
-                "total_tokens",
-                "prefill_tokens",
-                "decode_tokens",
-                "kv_cache_used",
-                "kv_cache_total",
-                "running_count",
-                "waiting_count",
-                "preempted_count",
-                "scheduler_action",
-            ]
-        )
+        self.per_iteration_writer.writerow([
+            "iteration_id", "start_time", "end_time", "duration", "scheduling_overhead",
+            "forward_duration", "batch_size", "total_tokens", "prefill_tokens",
+            "decode_tokens", "kv_cache_used", "kv_cache_total", "running_count",
+            "waiting_count", "preempted_count", "scheduler_action"
+        ])
 
         # per_iteration_requests.csv
         self.per_iteration_requests_file = open(
             self.log_dir / "per_iteration_requests.csv", "w", newline=""
         )
-        self.per_iteration_requests_writer = csv.writer(
-            self.per_iteration_requests_file
-        )
-        self.per_iteration_requests_writer.writerow(
-            [
-                "iteration_id",
-                "request_id",
-                "state",
-                "queue_position",
-                "waiting_reason",
-                "tokens_generated",
-                "kv_cache_blocks",
-                "time_in_state",
-            ]
-        )
+        self.per_iteration_requests_writer = csv.writer(self.per_iteration_requests_file)
+        self.per_iteration_requests_writer.writerow([
+            "iteration_id", "request_id", "state", "queue_position", "waiting_reason",
+            "tokens_generated", "kv_cache_blocks", "time_in_state"
+        ])
 
         # events.csv
         self.events_file = open(self.log_dir / "events.csv", "w", newline="")
         self.events_writer = csv.writer(self.events_file)
-        self.events_writer.writerow(
-            ["timestamp", "event_type", "request_id", "details"]
-        )
+        self.events_writer.writerow([
+            "timestamp", "event_type", "request_id", "details"
+        ])
 
     def _get_relative_time_ns(self) -> int:
         """상대 시간 (nanosecond)"""
@@ -322,32 +243,14 @@ class SchedulerLogger:
         self._record_event("request_arrived", request.request_id)
 
     def record_request_scheduled(self, request_id: str) -> None:
-        """Request가 scheduled된 시점 기록
-
-        NOTE, hyunnnchoi, 2026.01.26
-        first_scheduled_time 업데이트와 상태 전이(running)를 분리하여,
-        Preemption 후 재개(Resume)된 요청도 상태 전이가 정확히 기록되도록 수정.
-        이전에는 first_scheduled_time 조건문 내부에서만 _update_state가 호출되어
-        재개된 요청의 execution_time이 정확하게 계산되지 않는 버그가 있었음.
-        """
+        """Request가 처음 scheduled된 시점 기록"""
         if not self.enabled:
             return
 
         metrics = self.request_metrics.get(request_id)
-        if not metrics:
-            return
-
-        # NOTE, hyunnnchoi, 2026.01.26
-        # first_scheduled_time은 최초 한 번만 기록
-        if metrics.first_scheduled_time == 0:
+        if metrics and metrics.first_scheduled_time == 0:
             metrics.first_scheduled_time = self._get_relative_time_ns()
             self._record_event("request_scheduled", request_id)
-
-        # NOTE, hyunnnchoi, 2026.01.26
-        # 상태 전이는 매번 호출되어야 함 (Preemption 후 Resume 포함)
-        # 이미 running 상태인 경우는 중복 전이를 방지
-        if metrics.current_state != "running":
-            self._record_event("request_resumed", request_id)
             self._update_state(request_id, "running")
 
     def record_first_token_generated(self, request_id: str) -> None:
@@ -384,45 +287,14 @@ class SchedulerLogger:
             self._update_state(request_id, "completed")
             self._record_event("request_completed", request_id)
 
-    def record_output_begin(self) -> None:
-        """Output processing 시작 시점 기록
-
-        NOTE, hyunnnchoi, 2026.01.26
-        update_from_output() 시작 시점에 호출하여 forward_pass_duration 계산에 사용.
-        forward_pass_duration = output_begin_time - prev_iteration_end_time
-        """
-        if not self.enabled:
-            return
-
-        current_time = self._get_relative_time_ns()
-        self._output_begin_time = current_time
-
-        # Forward pass duration 계산 (이전 iteration_end ~ 현재 output_begin)
-        if self._prev_iteration_end_time > 0 and len(self.iteration_metrics) > 0:
-            prev_metrics = self.iteration_metrics[-1]
-            prev_metrics.forward_pass_duration = (
-                current_time - self._prev_iteration_end_time
-            )
-
     def begin_iteration(self) -> None:
         """Iteration 시작"""
         if not self.enabled:
             return
 
-        current_time = self._get_relative_time_ns()
-
-        # NOTE, hyunnnchoi, 2026.01.26
-        # 이전 iteration의 output_processing_duration 계산
-        # (이전 output_begin ~ 현재 iteration_begin 사이의 시간)
-        if self._output_begin_time > 0 and len(self.iteration_metrics) > 0:
-            prev_metrics = self.iteration_metrics[-1]
-            prev_metrics.output_processing_duration = (
-                current_time - self._output_begin_time
-            )
-
         self.current_iteration_metrics = IterationMetrics(
             iteration_id=self.current_iteration_id,
-            iteration_start_time=current_time,
+            iteration_start_time=self._get_relative_time_ns(),
         )
 
     def end_iteration(
@@ -464,15 +336,9 @@ class SchedulerLogger:
         metrics.running_requests = running_requests.copy()
         metrics.waiting_requests = waiting_requests.copy()
         metrics.batch_size = len(running_requests)
-        metrics.preempted_requests = (
-            preempted_requests.copy() if preempted_requests else []
-        )
-        metrics.admitted_requests = (
-            admitted_requests.copy() if admitted_requests else []
-        )
-        metrics.completed_requests = (
-            completed_requests.copy() if completed_requests else []
-        )
+        metrics.preempted_requests = preempted_requests.copy() if preempted_requests else []
+        metrics.admitted_requests = admitted_requests.copy() if admitted_requests else []
+        metrics.completed_requests = completed_requests.copy() if completed_requests else []
         metrics.scheduler_action = scheduler_action
 
         # KV cache 상태
@@ -490,10 +356,6 @@ class SchedulerLogger:
                     prefill, decode = prefill_decode_info[req_id]
                     metrics.prefill_tokens += prefill
                     metrics.decode_tokens += decode
-
-        # NOTE, hyunnnchoi, 2026.01.26
-        # iteration 종료 시점 기록 (forward pass 시간 계산에 사용)
-        self._prev_iteration_end_time = current_time
 
         # 메트릭 저장
         self.iteration_metrics.append(metrics)
@@ -541,9 +403,7 @@ class SchedulerLogger:
             if metrics:
                 # 현재 waiting reason 사용 (가장 최근 것)
                 waiting_reason = metrics.current_waiting_reason or (
-                    metrics.waiting_reasons[-1]
-                    if metrics.waiting_reasons
-                    else "unknown"
+                    metrics.waiting_reasons[-1] if metrics.waiting_reasons else "unknown"
                 )
                 state = RequestStateInIteration(
                     iteration_id=self.current_iteration_id,
@@ -567,9 +427,7 @@ class SchedulerLogger:
             metrics.waiting_reasons.append(reason.value)
             metrics.current_waiting_reason = reason.value
 
-    def update_kv_cache_blocks(
-        self, request_id: str, num_blocks: int, block_size: int = 0
-    ) -> None:
+    def update_kv_cache_blocks(self, request_id: str, num_blocks: int, block_size: int = 0) -> None:
         """KV cache block 수 및 메모리 업데이트"""
         if not self.enabled:
             return
@@ -613,11 +471,8 @@ class SchedulerLogger:
         }
         metrics.state_transitions.append(transition)
 
-        # NOTE, hyunnnchoi, 2026.01.26
         # Waiting/execution time 누적
-        # 'preempted' 상태도 'waiting'과 마찬가지로 대기 시간에 포함되어야 함.
-        # Preemption 후 재개되기까지의 시간도 요청 관점에서는 대기 시간이기 때문.
-        if metrics.current_state in ("waiting", "preempted"):
+        if metrics.current_state == "waiting":
             metrics.waiting_time += time_in_state
         elif metrics.current_state == "running":
             metrics.execution_time += time_in_state
@@ -626,9 +481,7 @@ class SchedulerLogger:
         metrics.current_state = new_state
         metrics.state_start_time = current_time
 
-    def _record_event(
-        self, event_type: str, request_id: str, details: str = ""
-    ) -> None:
+    def _record_event(self, event_type: str, request_id: str, details: str = "") -> None:
         """이벤트 기록"""
         event = SchedulerEvent(
             timestamp=self._get_relative_time_ns(),
@@ -660,58 +513,55 @@ class SchedulerLogger:
         if not self.enabled:
             return
 
-        # NOTE, hyunnnchoi, 2026.01.26
-        # Iteration 메트릭 쓰기 (forward_pass_duration, output_processing_duration 추가)
+        # Iteration 메트릭 쓰기
         for metrics in self.iteration_metrics:
-            self.per_iteration_writer.writerow(
-                [
-                    metrics.iteration_id,
-                    metrics.iteration_start_time,
-                    metrics.iteration_end_time,
-                    metrics.iteration_duration,
-                    metrics.scheduling_overhead,
-                    metrics.forward_pass_duration,
-                    metrics.output_processing_duration,
-                    metrics.batch_size,
-                    metrics.total_tokens_in_batch,
-                    metrics.prefill_tokens,
-                    metrics.decode_tokens,
-                    metrics.kv_cache_used,
-                    metrics.kv_cache_total,
-                    len(metrics.running_requests),
-                    len(metrics.waiting_requests),
-                    len(metrics.preempted_requests),
-                    metrics.scheduler_action,
-                ]
+            forward_duration = (
+                metrics.iteration_duration - metrics.scheduling_overhead
+                if metrics.scheduling_overhead > 0
+                else 0
             )
+            self.per_iteration_writer.writerow([
+                metrics.iteration_id,
+                metrics.iteration_start_time,
+                metrics.iteration_end_time,
+                metrics.iteration_duration,
+                metrics.scheduling_overhead,
+                forward_duration,
+                metrics.batch_size,
+                metrics.total_tokens_in_batch,
+                metrics.prefill_tokens,
+                metrics.decode_tokens,
+                metrics.kv_cache_used,
+                metrics.kv_cache_total,
+                len(metrics.running_requests),
+                len(metrics.waiting_requests),
+                len(metrics.preempted_requests),
+                metrics.scheduler_action,
+            ])
         self.iteration_metrics.clear()
 
         # Iteration별 request 상태 쓰기
         for state in self.iteration_request_states:
-            self.per_iteration_requests_writer.writerow(
-                [
-                    state.iteration_id,
-                    state.request_id,
-                    state.state,
-                    state.queue_position,
-                    state.waiting_reason,
-                    state.tokens_generated_so_far,
-                    state.kv_cache_blocks,
-                    state.time_in_current_state,
-                ]
-            )
+            self.per_iteration_requests_writer.writerow([
+                state.iteration_id,
+                state.request_id,
+                state.state,
+                state.queue_position,
+                state.waiting_reason,
+                state.tokens_generated_so_far,
+                state.kv_cache_blocks,
+                state.time_in_current_state,
+            ])
         self.iteration_request_states.clear()
 
         # 이벤트 쓰기
         for event in self.events:
-            self.events_writer.writerow(
-                [
-                    event.timestamp,
-                    event.event_type,
-                    event.request_id,
-                    event.details,
-                ]
-            )
+            self.events_writer.writerow([
+                event.timestamp,
+                event.event_type,
+                event.request_id,
+                event.details,
+            ])
         self.events.clear()
 
         # 파일 flush
@@ -743,39 +593,35 @@ class SchedulerLogger:
             throughput = (metrics.output_token_count * 1_000_000_000) / e2e_latency
 
         # CSV에 쓰기 (새로운 필드 포함)
-        self.per_request_writer.writerow(
-            [
-                metrics.request_id,
-                metrics.arrival_time,
-                metrics.first_scheduled_time,
-                metrics.completion_time,
-                metrics.waiting_time,
-                metrics.execution_time,
-                e2e_latency,
-                metrics.input_token_count,
-                metrics.output_token_count,
-                metrics.ttft,
-                tpot,
-                f"{throughput:.2f}",
-                metrics.preemption_count,
-                metrics.eviction_count,
-                metrics.kv_cache_blocks,
-                metrics.kv_cache_memory_bytes,
-                metrics.priority_score,
-            ]
-        )
+        self.per_request_writer.writerow([
+            metrics.request_id,
+            metrics.arrival_time,
+            metrics.first_scheduled_time,
+            metrics.completion_time,
+            metrics.waiting_time,
+            metrics.execution_time,
+            e2e_latency,
+            metrics.input_token_count,
+            metrics.output_token_count,
+            metrics.ttft,
+            tpot,
+            f"{throughput:.2f}",
+            metrics.preemption_count,
+            metrics.eviction_count,
+            metrics.kv_cache_blocks,
+            metrics.kv_cache_memory_bytes,
+            metrics.priority_score,
+        ])
         self.per_request_file.flush()
 
         # State transitions를 별도 파일에 기록
         for transition in metrics.state_transitions:
-            self.state_transitions_writer.writerow(
-                [
-                    metrics.request_id,
-                    transition["time"],
-                    transition["state"],
-                    transition["duration_in_prev_state"],
-                ]
-            )
+            self.state_transitions_writer.writerow([
+                metrics.request_id,
+                transition["time"],
+                transition["state"],
+                transition["duration_in_prev_state"],
+            ])
         self.state_transitions_file.flush()
 
     def shutdown(self) -> None:
