@@ -15,7 +15,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 # 디렉토리 경로
-FETCH_DIR="/home/work/hyunmokchoi/vllm-fetch"
+FETCH_DIR="/home/work/hyunmokchoi/vllm-fetch/vllm-fetch"
 BACKUP_DIR="$FETCH_DIR/.backup"
 MANIFEST_FILE="$BACKUP_DIR/manifest.txt"
 
@@ -61,9 +61,14 @@ fetch_files() {
     # 백업 디렉토리 생성
     mkdir -p "$BACKUP_DIR"
 
-    # 기존 manifest 파일이 있으면 삭제
+    # 백업 디렉토리가 root 소유인 경우 소유권 변경
+    if [ -d "$BACKUP_DIR" ]; then
+        sudo chown -R $USER:$USER "$BACKUP_DIR" 2>/dev/null || true
+    fi
+
+    # 기존 manifest 파일이 있으면 삭제 (sudo 권한으로 생성된 파일도 처리)
     if [ -f "$MANIFEST_FILE" ]; then
-        rm "$MANIFEST_FILE"
+        rm "$MANIFEST_FILE" 2>/dev/null || sudo rm "$MANIFEST_FILE" 2>/dev/null || true
     fi
 
     # 복사된 파일 수 카운터
@@ -95,7 +100,7 @@ fetch_files() {
         # 경로가 절대 경로인지 확인
         if [[ ! "$destination" =~ ^/ ]]; then
             echo -e "${RED}  - $filename: 상대 경로는 지원하지 않습니다 ($destination)${NC}"
-            ((FAILED_COUNT++))
+            FAILED_COUNT=$((FAILED_COUNT + 1))
             continue
         fi
 
@@ -129,7 +134,7 @@ fetch_files() {
         # 권한 설정 (읽기/쓰기 권한)
         chmod 644 "$destination"
 
-        ((COPIED_COUNT++))
+        COPIED_COUNT=$((COPIED_COUNT + 1))
     done
 
     echo ""
@@ -172,17 +177,17 @@ rollback_files() {
             if [ -f "$destination" ]; then
                 echo -e "${YELLOW}  - 삭제: $destination (새로 생성된 파일)${NC}"
                 rm "$destination"
-                ((REMOVED_COUNT++))
+                REMOVED_COUNT=$((REMOVED_COUNT + 1))
             fi
         else
             # 백업 파일 복원
             if [ -f "$backup_path" ]; then
                 echo -e "${GREEN}  - 복원: $backup_path -> $destination${NC}"
                 cp "$backup_path" "$destination"
-                ((RESTORED_COUNT++))
+                RESTORED_COUNT=$((RESTORED_COUNT + 1))
             else
                 echo -e "${RED}  - 실패: 백업 파일을 찾을 수 없습니다 ($backup_path)${NC}"
-                ((FAILED_COUNT++))
+                FAILED_COUNT=$((FAILED_COUNT + 1))
             fi
         fi
     done < "$MANIFEST_FILE"
