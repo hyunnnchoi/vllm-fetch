@@ -1,0 +1,44 @@
+[vLLM Scheduler Logging Refactoring Guide]
+
+1. 배경 및 목적
+- 현재 vLLM v1 스케줄러의 로깅 시스템(logger.py, scheduler.py)에서 데이터 왜곡 및 분석 공백이 발견됨.
+- Preemption(선점) 상황에서 Request-level 메트릭이 누락되지 않도록 수정하고, Iteration 간의 알 수 없는 '시간적 Gap'을 세부적으로 분해하여 기록하는 것이 목적임.
+
+2. 발견된 문제점
+A. execution_time 데이터 오염 (logger.py)
+   - record_request_scheduled() 함수에 `if metrics.first_scheduled_time == 0` 조건이 있어, Preemption 후 재개(Resume)된 요청의 상태 변화가 기록되지 않음.
+   - 이로 인해 선점이 발생한 요청의 실제 execution_time이 전체 실행 시간보다 훨씬 작게 기록되는 버그가 있음.
+
+B. per_iteration.csv의 분석 불가한 Gap
+   - 현재 duration은 schedule() 함수 내부 소요 시간(~1ms)만 측정함.
+   - 하지만 행 간 간격(Next Start - Prev End)이 ~100ms로 매우 크게 나타남.
+   - 이 Gap 안에는 [모델 Forward Pass], [Output Processing(Sampling 등)]이 섞여 있으나 구분이 안 됨.
+
+3. 해결 방안 (TODO List)
+
+TASK 1: Preemption 대응 및 execution_time 정교화
+- logger.py 수정:
+  * record_request_scheduled()에서 `first_scheduled_time` 업데이트와 `_update_state(req_id, "running")`를 분리할 것. 
+  * 요청이 재개될 때마다 반드시 `_update_state`가 호출되어 'running' 상태 누적 시간이 정확히 계산되도록 수정.
+  * record_request_preempted() 호출 시 상태가 'preempted'로 정확히 전이되는지 재확인.
+
+TASK 2: Iteration 시간 Breakdown 기록
+- IterationMetrics 데이터 클래스 확장:
+  * scheduling_overhead, forward_pass_duration, output_processing_duration 필드 추가.
+- SchedulerLogger에 신규 훅(Hook) 추가:
+  * record_forward_begin(), record_forward_end() 함수 구현.
+- scheduler.py에 훅 연결:
+  * schedule() 함수가 끝나고 리턴하기 직전에 record_forward_begin() 호출.
+  * update_from_output() 함수가 시작되자마자 record_forward_end() 호출.
+- 계산 로직:
+  * forward_pass_duration = (record_forward_end - record_forward_begin)
+  * output_processing_duration = (Next_begin_iteration - record_forward_end)
+  * 이 값들을 per_iteration.csv에 추가하여 기록할 것.
+
+4. 참고 사항
+- 현재 duration 컬럼은 사실상 scheduling_overhead와 동일함. 
+- Breakdown이 완료되면 per_iteration.csv의 한 행만 보고도 [스케줄링 / 모델 연산 / 결과 처리] 비중을 한눈에 알 수 있어야 함.
+
+5. 추가 발견된 잠재적 오류 및 개선 권고
+A. Waiting Time 계산 오류 (logger.py:475)
+   - 'preempted' 상태로 머무는 시간도 'waiting_time'에 합산되도록 로직 수정 필요.

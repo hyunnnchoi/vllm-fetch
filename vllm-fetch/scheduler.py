@@ -692,6 +692,16 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+        # NOTE, hyunnnchoi, 2026.01.28
+        # If while loop ended due to token_budget exhaustion, mark remaining
+        # waiting requests as blocked by MAX_NUM_BATCHED_TOKENS (HOL blocking)
+        if self.waiting and token_budget <= 0:
+            for req in self.waiting:
+                self.scheduler_logger.set_waiting_reason(
+                    req.request_id, WaitingReason.MAX_NUM_BATCHED_TOKENS
+                )
+
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
