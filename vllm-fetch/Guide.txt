@@ -1,0 +1,8 @@
+LMCache config path: 
+/home/work/hyunmokchoi/multi_turn_0.13.0/motivation_v4_lmcache/lmcache_config.yaml
+
+LMCache offloading storage path: 
+/home/work/hyunmokchoi/multi_turn_0.13.0/motivation_v4_lmcache/lmcache
+
+Dataset path: 
+/home/work/hyunmokchoi/multi_turn/sharegpt_conv_1024_calibrated_cleaned_v2.json

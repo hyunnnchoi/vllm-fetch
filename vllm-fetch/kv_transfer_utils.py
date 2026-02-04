@@ -6,6 +6,11 @@ import csv
 import inspect
 import os
 import time
+
+# NOTE, hyunnnchoi, 2026.02.03
+# 다중 프로세스 CSV 동시 쓰기 충돌 방지
+# NOTE, hyunnnchoi, 2026.02.03
+# 프로세스별 CSV 분리로 락 제거
 from collections.abc import Callable
 from functools import wraps
 from pathlib import Path
@@ -26,6 +31,9 @@ logger = init_logger(__name__)
 _kv_transfer_csv_file = None
 _kv_transfer_csv_writer = None
 _kv_transfer_log_enabled = False
+# NOTE, hyunnnchoi, 2026.02.03
+# 로깅 초기화 시도 여부 플래그 추가
+_kv_transfer_log_attempted = False
 _kv_transfer_iteration_counter = 0
 _kv_transfer_last_flush_time = 0.0
 
@@ -36,7 +44,9 @@ def _init_kv_transfer_csv():
         _kv_transfer_csv_file, \
         _kv_transfer_csv_writer, \
         _kv_transfer_log_enabled, \
+        _kv_transfer_log_attempted, \
         _kv_transfer_last_flush_time
+    _kv_transfer_log_attempted = True
 
     # 환경변수로 로깅 활성화 여부 확인 (두 변수 모두 지원)
     log_dir = os.environ.get("VLLM_SCHED_LOG_DIR") or os.environ.get(
@@ -50,8 +60,10 @@ def _init_kv_transfer_csv():
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
-    # CSV 파일 생성 및 헤더 작성
-    csv_path = log_path / "kv_transfer_timing.csv"
+    # NOTE, hyunnnchoi, 2026.02.03
+    # 프로세스별 CSV 파일 생성 및 헤더 작성
+    pid = os.getpid()
+    csv_path = log_path / f"kv_transfer_timing_pid_{pid}.csv"
     _kv_transfer_csv_file = open(csv_path, "w", newline="", buffering=8192)
     _kv_transfer_csv_writer = csv.writer(_kv_transfer_csv_file)
     _kv_transfer_csv_writer.writerow(
@@ -65,9 +77,8 @@ def _init_kv_transfer_csv():
         ]
     )
 
-    # 설정값 읽기
-    sample_rate = int(os.environ.get("VLLM_KV_TRANSFER_LOG_SAMPLE_RATE", "10"))
-    threshold_us = float(os.environ.get("VLLM_KV_TRANSFER_LOG_THRESHOLD_US", "100.0"))
+    # NOTE, hyunnnchoi, 2026.02.03
+    # Flush 간격 설정값 읽기 (샘플링/임계값은 비활성화됨)
     flush_interval_sec = float(
         os.environ.get("VLLM_KV_TRANSFER_LOG_FLUSH_INTERVAL", "5.0")
     )
@@ -77,7 +88,7 @@ def _init_kv_transfer_csv():
 
     logger.info(
         f"KV transfer timing CSV initialized at {csv_path} "
-        f"(sample_rate=1/{sample_rate}, threshold={threshold_us}μs, "
+        f"(sampling=disabled, threshold=disabled, "
         f"flush_interval={flush_interval_sec}s)"
     )
 
@@ -85,21 +96,20 @@ def _init_kv_transfer_csv():
 def _log_kv_transfer_timing(
     layer_name: str, wait_time: float, attn_time: float, save_time: float
 ):
-    """KV transfer 타이밍을 CSV에 기록 (샘플링 + 임계값 필터링)"""
+    """KV transfer 타이밍을 CSV에 기록 (모든 레이어 기록)"""
     global \
         _kv_transfer_csv_writer, \
         _kv_transfer_csv_file, \
         _kv_transfer_iteration_counter, \
+        _kv_transfer_log_attempted, \
         _kv_transfer_last_flush_time
 
-    if not _kv_transfer_log_enabled:
-        return
-
-    # 첫 호출 시 CSV 초기화
-    if _kv_transfer_csv_writer is None:
+    # NOTE, hyunnnchoi, 2026.02.03
+    # 환경변수 기반으로 첫 호출 시에만 CSV 초기화
+    if _kv_transfer_csv_writer is None and not _kv_transfer_log_attempted:
         _init_kv_transfer_csv()
 
-    if _kv_transfer_csv_writer is None:
+    if (not _kv_transfer_log_enabled) or (_kv_transfer_csv_writer is None):
         return
 
     wait_us = wait_time * 1e6
@@ -107,16 +117,11 @@ def _log_kv_transfer_timing(
     save_us = save_time * 1e6
     total_us = (wait_time + attn_time + save_time) * 1e6
 
-    # 샘플링 및 임계값 필터링
-    sample_rate = int(os.environ.get("VLLM_KV_TRANSFER_LOG_SAMPLE_RATE", "10"))
-    threshold_us = float(os.environ.get("VLLM_KV_TRANSFER_LOG_THRESHOLD_US", "100.0"))
-
     _kv_transfer_iteration_counter += 1
 
-    # 조건: (샘플링에 걸리거나) OR (wait_time이 임계값 초과)
-    should_log = (_kv_transfer_iteration_counter % sample_rate == 0) or (
-        wait_us > threshold_us
-    )
+    # NOTE, hyunnnchoi, 2026.02.03
+    # 모든 레이어 기록 (필터링 비활성화)
+    should_log = True
 
     if not should_log:
         return
