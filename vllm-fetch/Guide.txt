@@ -3,7 +3,7 @@ Step 1)
 Step 2)
 ./vllm_fetch.sh
 
-Step 3) Make config files and directories(folders) -
+Step 3) Make config files and directories(folders) --> 경로 수정해서 사용하세요
 LMCache config path:
 /home/work/hyunmokchoi/multi_turn_0.13.0/motivation_v4_lmcache/lmcache_config.yaml
 
@@ -14,3 +14,4 @@ Dataset path:
 /home/work/hyunmokchoi/multi_turn/sharegpt_conv_1024_calibrated_cleaned_v2.json
 
 Step 4) refer notion
+--> 결과 저장되는 디렉토리 Path 등 적절히 바꿔서 사용하세요
