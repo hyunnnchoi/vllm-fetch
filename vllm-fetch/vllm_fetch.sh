@@ -19,56 +19,21 @@ FETCH_DIR="/home/work/hyunmokchoi/vllm-fetch/vllm-fetch"
 BACKUP_DIR="$FETCH_DIR/.backup"
 MANIFEST_FILE="$BACKUP_DIR/manifest.txt"
 
-# 폴더 소유권 변경 함수
-change_ownership() {
-    echo -e "${BLUE}[1/3] 폴더 소유권 변경 중...${NC}"
 
-    # /vllm 및 /lmcache 폴더의 소유권을 현재 사용자로 변경
-    if [ -d "/vllm" ]; then
-        echo -e "${YELLOW}  - /vllm 폴더 소유권 변경 (sudo 권한 필요)${NC}"
-        if sudo chown -R $USER:$USER /vllm 2>/dev/null; then
-            echo -e "${GREEN}    ✓ /vllm 폴더 소유권 변경 완료${NC}"
-        else
-            echo -e "${RED}    ✗ /vllm 폴더 소유권 변경 실패 (sudo 권한 필요 또는 이미 권한 있음)${NC}"
-        fi
-    else
-        echo -e "${YELLOW}  - /vllm 폴더가 존재하지 않습니다${NC}"
-    fi
-
-    if [ -d "/lmcache" ]; then
-        echo -e "${YELLOW}  - /lmcache 폴더 소유권 변경 (sudo 권한 필요)${NC}"
-        if sudo chown -R $USER:$USER /lmcache 2>/dev/null; then
-            echo -e "${GREEN}    ✓ /lmcache 폴더 소유권 변경 완료${NC}"
-        else
-            echo -e "${RED}    ✗ /lmcache 폴더 소유권 변경 실패 (sudo 권한 필요 또는 이미 권한 있음)${NC}"
-        fi
-    else
-        echo -e "${YELLOW}  - /lmcache 폴더가 존재하지 않습니다${NC}"
-    fi
-
-    echo ""
-}
 
 # Fetch 모드 함수
 fetch_files() {
     echo -e "${BLUE}=== Starting vllm-fetch mode ===${NC}"
     echo ""
 
-    change_ownership
-
-    echo -e "${BLUE}[2/3] 파일 백업 및 복사 중...${NC}"
+    echo -e "${BLUE}[1/3] 파일 백업 및 복사 중...${NC}"
 
     # 백업 디렉토리 생성
     mkdir -p "$BACKUP_DIR"
 
-    # 백업 디렉토리가 root 소유인 경우 소유권 변경
-    if [ -d "$BACKUP_DIR" ]; then
-        sudo chown -R $USER:$USER "$BACKUP_DIR" 2>/dev/null || true
-    fi
-
-    # 기존 manifest 파일이 있으면 삭제 (sudo 권한으로 생성된 파일도 처리)
+    # 기존 manifest 파일이 있으면 삭제
     if [ -f "$MANIFEST_FILE" ]; then
-        rm "$MANIFEST_FILE" 2>/dev/null || sudo rm "$MANIFEST_FILE" 2>/dev/null || true
+        rm "$MANIFEST_FILE"
     fi
 
     # 복사된 파일 수 카운터
@@ -155,9 +120,7 @@ rollback_files() {
     echo -e "${BLUE}=== Starting vllm-rollback mode ===${NC}"
     echo ""
 
-    change_ownership
-
-    echo -e "${BLUE}[2/3] 파일 복원 중...${NC}"
+    echo -e "${BLUE}[1/3] 파일 복원 중...${NC}"
 
     # manifest 파일 확인
     if [ ! -f "$MANIFEST_FILE" ]; then
