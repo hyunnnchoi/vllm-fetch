@@ -7,6 +7,8 @@ Add detailed scheduler logging functionality migrated from vLLM v0.13.0.
 This enables comprehensive request-level and iteration-level metrics
 collection for research and performance analysis.
 
+Usage: `git apply /home/work/hyunmokchoi/vllm-fetch/scheduler-logging.patch`
+
 Changes:
 - Add SchedulerLogger class with CSV-based metrics collection
 - Integrate logging hooks throughout scheduler lifecycle
