@@ -1,0 +1,19 @@
+# scheduler-logging.patch
+cd /vllm
+git am /home/work/hyunmokchoi/vllm-fetch/patchfiles/scheduler-logging.patch
+
+# lmcache-fix-2268-adapted.patch
+cd /lmcache
+git apply /home/work/hyunmokchoi/vllm-fetch/patchfiles/lmcache-fix-2268-adapted.patch
+
+# benchmark_serving_multi_turn.patch
+cd /vllm
+git apply /home/work/hyunmokchoi/vllm-fetch/patchfiles/benchmark_serving_multi_turn.patch
+
+# lmcache_v0.3.13_combined_logging.patch
+cd /lmcache
+git apply --3way /home/work/hyunmokchoi/vllm-fetch/patchfiles/lmcache_v0.3.13_combined_logging.patch
+
+# disable_gpu_prefix_cache.patch
+cd /vllm
+git apply /home/work/hyunmokchoi/vllm-fetch/patchfiles/disable_gpu_prefix_cache.patch
