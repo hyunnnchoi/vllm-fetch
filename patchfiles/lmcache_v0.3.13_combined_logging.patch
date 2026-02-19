@@ -1,0 +1,1428 @@
+diff --git a/lmcache/v1/csv_logger.py b/lmcache/v1/csv_logger.py
+new file mode 100644
+index 0000000..81fe4bc
+--- /dev/null
++++ b/lmcache/v1/csv_logger.py
+@@ -0,0 +1,721 @@
++# SPDX-License-Identifier: Apache-2.0
++"""
++Structured CSV event logger for LMCache operations.
++
++Activation
++----------
++Set the environment variable before starting LMCache::
++
++    export LMCACHE_CSV_LOG_PATH=/path/to/output.csv
++
++If the variable is unset or empty, no CSV file is written and every
++``LMCacheCSVLogger.get()`` call returns ``None``, so callers are safe to
++write ``if csv := LMCacheCSVLogger.get(): csv.store_chunk(...)`` without
++any extra guard.
++
++CSV schema
++----------
++Each row represents one discrete event.  Columns that are not meaningful
++for a given event type are left empty.
++
++Common columns (always present):
++    timestamp       ISO-8601 wall-clock time (microsecond resolution)
++    epoch_time      Unix epoch float (seconds, 6 decimal places)
++    event_type      Categorical label – see the list below
++    request_id      Integer LMCache-internal request counter
++                    (monotonically increasing, reset between processes)
++    lookup_id       String key used by the prefetch / async-lookup path
++    worker_id       Tensor-parallel rank / worker index from LMCacheMetadata
++
++Event-type catalogue
++--------------------
++Offloading (GPU → CPU/Disk, triggered by ``store()``):
++    store_chunk             Per-chunk during store: allocation + key info
++    store_gpu_to_cpu_done   Whole-batch GPU→CPU transfer finished
++    store_complete          Entire store() call finished
++
++Layer-wise store (``store_layer()``):
++    store_layer_start       Layerwise store begins
++    store_layer             Single transformer-layer store+put finished
++    store_layer_complete    All layers stored
++
++Retrieve (``retrieve()`` / ``_process_tokens_internal()``):
++    retrieve_chunk_discover Per-chunk during retrieve token processing
++    retrieve_batch_get      batched_get() call against one storage location
++    retrieve_process_done   Token-processing phase complete
++    retrieve_complete       Entire retrieve() call finished
++
++Layer-wise retrieve (``retrieve_layer()``):
++    retrieve_layer_start    Layerwise retrieve begins
++    retrieve_layer_get      Per-layer async get task submitted
++    retrieve_layer          Per-layer CPU→GPU transfer complete
++    retrieve_layer_complete All layers delivered to GPU
++
++Lookup (``lookup()``):
++    lookup_complete         Prefix-length result returned to caller
++
++Prefetch (``async_lookup_and_prefetch()``):
++    prefetch_submit         Async prefetch task enqueued
++    prefetch_backend_contains  Per-backend batched_async_contains result
++    prefetch_backend_done   Single-backend loading task finished
++    prefetch_tier_result    Per-tier eviction analysis after all tasks done
++    prefetch_complete       All tiers done; response sent to scheduler
++"""
++
++import csv
++import datetime
++import os
++import threading
++import time
++from typing import Dict, Optional
++
++# ---------------------------------------------------------------------------
++# CSV column schema
++# ---------------------------------------------------------------------------
++_FIELDS = [
++    # ── Universal ────────────────────────────────────────────────────────
++    "timestamp",            # ISO-8601 wall-clock (µs resolution)
++    "epoch_time",           # Unix epoch float (s, 6 dp)
++    "event_type",           # categorical label
++    "request_id",           # LMCache internal integer request id
++    "lookup_id",            # string id used by prefetch / async-lookup
++    "worker_id",            # tensor-parallel worker index
++    # ── Chunk ────────────────────────────────────────────────────────────
++    "chunk_idx",            # 0-based chunk index within this request
++    "start_token",          # inclusive start token position
++    "end_token",            # exclusive end token position
++    "chunk_tokens",         # end_token - start_token
++    "key_hash",             # hex string of CacheEngineKey.chunk_hash
++    # ── Layer ────────────────────────────────────────────────────────────
++    "layer_id",             # 0-based transformer layer index
++    "num_layers",           # total transformer layers in the model
++    # ── Aggregates ───────────────────────────────────────────────────────
++    "num_chunks",           # chunk count for this batch / request
++    "total_tokens",         # token count for this batch / request
++    "size_gb",              # data volume in GiB
++    # ── Timing ───────────────────────────────────────────────────────────
++    "duration_ms",          # operation wall-clock duration (ms)
++    "throughput_gbps",      # effective data throughput (GB/s)
++    "submit_epoch",         # Unix epoch when prefetch was submitted
++    "done_epoch",           # Unix epoch when prefetch completed
++    # ── Storage ──────────────────────────────────────────────────────────
++    "location",             # storage location identifier (e.g. LocalCPUBackend)
++    "backend_name",         # storage backend class name
++    # ── Prefetch / tier ──────────────────────────────────────────────────
++    "tier_idx",             # 0-based tier index
++    "expected_chunks",      # chunks expected from tier before retrieval
++    "actual_chunks",        # chunks actually retrieved from tier
++    "eviction_rate",        # fraction lost to eviction (0.0–1.0)
++    # ── Hit statistics ───────────────────────────────────────────────────
++    "hit_chunks",           # number of chunks that were cache hits
++    "hit_tokens",           # number of tokens that were cache hits
++    # ── Mode flags ───────────────────────────────────────────────────────
++    "async_loading",        # True / False
++    "is_layerwise",         # True / False
++    # ── Misc ─────────────────────────────────────────────────────────────
++    "notes",                # free-form extra info
++]
++
++
++# ---------------------------------------------------------------------------
++# Singleton logger class
++# ---------------------------------------------------------------------------
++class LMCacheCSVLogger:
++    """Thread-safe singleton that writes LMCache events to a CSV file.
++
++    Obtain the instance (or ``None``) via :meth:`get`::
++
++        csv = LMCacheCSVLogger.get()
++        if csv:
++            csv.store_chunk(...)
++    """
++
++    _instance: Optional["LMCacheCSVLogger"] = None
++    _init_lock: threading.Lock = threading.Lock()
++
++    # ------------------------------------------------------------------
++    def __init__(self, path: str) -> None:
++        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
++        self._path = path
++        self._file_lock = threading.Lock()
++        # line-buffered so events reach disk promptly without explicit flush
++        self._file = open(path, "w", newline="", buffering=1)
++        self._writer = csv.DictWriter(
++            self._file, fieldnames=_FIELDS, extrasaction="ignore"
++        )
++        self._writer.writeheader()
++        self._file.flush()
++
++    # ------------------------------------------------------------------
++    # Singleton access
++    # ------------------------------------------------------------------
++    @classmethod
++    def get(cls) -> Optional["LMCacheCSVLogger"]:
++        """Return the singleton if ``LMCACHE_CSV_LOG_PATH`` is set, else None."""
++        if cls._instance is not None:
++            return cls._instance
++        path = os.environ.get("LMCACHE_CSV_LOG_PATH", "").strip()
++        if not path:
++            return None
++        with cls._init_lock:
++            if cls._instance is None:
++                cls._instance = cls(path)
++        return cls._instance
++
++    @classmethod
++    def destroy(cls) -> None:
++        """Flush and close the CSV file. Call on graceful shutdown."""
++        with cls._init_lock:
++            if cls._instance is not None:
++                try:
++                    cls._instance._file.flush()
++                    cls._instance._file.close()
++                except Exception:
++                    pass
++                cls._instance = None
++
++    # ------------------------------------------------------------------
++    # Internal write helpers
++    # ------------------------------------------------------------------
++    def _row(self, event_type: str, **kwargs) -> Dict[str, str]:
++        now = time.time()
++        row: Dict[str, str] = {f: "" for f in _FIELDS}
++        row["timestamp"] = datetime.datetime.fromtimestamp(now).isoformat(
++            timespec="microseconds"
++        )
++        row["epoch_time"] = f"{now:.6f}"
++        row["event_type"] = event_type
++        for k, v in kwargs.items():
++            if k in row and v is not None:
++                row[k] = str(v)
++        return row
++
++    def _write(self, row: Dict[str, str]) -> None:
++        with self._file_lock:
++            self._writer.writerow(row)
++
++    @staticmethod
++    def _throughput(size_gb: float, duration_ms: float) -> str:
++        if duration_ms > 0:
++            return f"{size_gb / (duration_ms / 1000):.4f}"
++        return ""
++
++    # ==================================================================
++    # Public logging methods – one per event type
++    # ==================================================================
++
++    # ── Offloading / store ──────────────────────────────────────────────
++
++    def store_chunk(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        chunk_idx: int,
++        start_token: int,
++        end_token: int,
++        key_hash: int,
++        size_gb: float,
++    ) -> None:
++        """Per-chunk allocation event during ``store()``."""
++        self._write(
++            self._row(
++                "store_chunk",
++                request_id=request_id,
++                worker_id=worker_id,
++                chunk_idx=chunk_idx,
++                start_token=start_token,
++                end_token=end_token,
++                chunk_tokens=end_token - start_token,
++                key_hash=f"0x{key_hash:x}",
++                size_gb=f"{size_gb:.6f}",
++            )
++        )
++
++    def store_gpu_to_cpu_done(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        num_chunks: int,
++        total_tokens: int,
++        size_gb: float,
++        duration_ms: float,
++    ) -> None:
++        """GPU→CPU DMA transfer finished."""
++        self._write(
++            self._row(
++                "store_gpu_to_cpu_done",
++                request_id=request_id,
++                worker_id=worker_id,
++                num_chunks=num_chunks,
++                total_tokens=total_tokens,
++                size_gb=f"{size_gb:.6f}",
++                duration_ms=f"{duration_ms:.3f}",
++                throughput_gbps=self._throughput(size_gb, duration_ms),
++            )
++        )
++
++    def store_complete(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        num_chunks: int,
++        total_tokens: int,
++        size_gb: float,
++        duration_ms: float,
++        from_gpu_ms: float,
++        put_ms: float,
++        process_tokens_ms: float,
++    ) -> None:
++        """Entire ``store()`` call finished."""
++        self._write(
++            self._row(
++                "store_complete",
++                request_id=request_id,
++                worker_id=worker_id,
++                num_chunks=num_chunks,
++                total_tokens=total_tokens,
++                size_gb=f"{size_gb:.6f}",
++                duration_ms=f"{duration_ms:.3f}",
++                throughput_gbps=self._throughput(size_gb, duration_ms),
++                notes=(
++                    f"process_tokens_ms={process_tokens_ms:.3f} "
++                    f"from_gpu_ms={from_gpu_ms:.3f} "
++                    f"put_ms={put_ms:.3f}"
++                ),
++            )
++        )
++
++    # ── Layer-wise store ────────────────────────────────────────────────
++
++    def store_layer_start(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        num_chunks: int,
++        num_layers: int,
++        total_tokens: int,
++        size_gb: float,
++    ) -> None:
++        """Layerwise store loop begins."""
++        self._write(
++            self._row(
++                "store_layer_start",
++                request_id=request_id,
++                worker_id=worker_id,
++                num_chunks=num_chunks,
++                num_layers=num_layers,
++                total_tokens=total_tokens,
++                size_gb=f"{size_gb:.6f}",
++                is_layerwise="True",
++            )
++        )
++
++    def store_layer(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        layer_id: int,
++        num_layers: int,
++        num_chunks: int,
++        duration_ms: float,
++    ) -> None:
++        """One transformer layer's GPU→CPU + put finished."""
++        self._write(
++            self._row(
++                "store_layer",
++                request_id=request_id,
++                worker_id=worker_id,
++                layer_id=layer_id,
++                num_layers=num_layers,
++                num_chunks=num_chunks,
++                duration_ms=f"{duration_ms:.3f}",
++                is_layerwise="True",
++            )
++        )
++
++    def store_layer_complete(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        num_chunks: int,
++        num_layers: int,
++        total_tokens: int,
++        size_gb: float,
++        duration_ms: float,
++    ) -> None:
++        """All layers of a layerwise store finished."""
++        self._write(
++            self._row(
++                "store_layer_complete",
++                request_id=request_id,
++                worker_id=worker_id,
++                num_chunks=num_chunks,
++                num_layers=num_layers,
++                total_tokens=total_tokens,
++                size_gb=f"{size_gb:.6f}",
++                duration_ms=f"{duration_ms:.3f}",
++                throughput_gbps=self._throughput(size_gb, duration_ms),
++                is_layerwise="True",
++            )
++        )
++
++    # ── Retrieve ────────────────────────────────────────────────────────
++
++    def retrieve_chunk_discover(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        chunk_idx: int,
++        start_token: int,
++        end_token: int,
++        key_hash: int,
++        async_loading: bool,
++    ) -> None:
++        """A chunk key was found during ``_process_tokens_internal``."""
++        self._write(
++            self._row(
++                "retrieve_chunk_discover",
++                request_id=request_id,
++                worker_id=worker_id,
++                chunk_idx=chunk_idx,
++                start_token=start_token,
++                end_token=end_token,
++                chunk_tokens=end_token - start_token,
++                key_hash=f"0x{key_hash:x}",
++                async_loading=str(async_loading),
++            )
++        )
++
++    def retrieve_batch_get(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        location: str,
++        num_chunks: int,
++        duration_ms: float,
++    ) -> None:
++        """``batched_get()`` from one storage location finished."""
++        self._write(
++            self._row(
++                "retrieve_batch_get",
++                request_id=request_id,
++                worker_id=worker_id,
++                location=location,
++                backend_name=location,
++                num_chunks=num_chunks,
++                duration_ms=f"{duration_ms:.3f}",
++            )
++        )
++
++    def retrieve_process_done(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        num_chunks: int,
++        size_gb: float,
++        duration_ms: float,
++        async_loading: bool,
++    ) -> None:
++        """Token-processing phase (chunk lookup) finished."""
++        self._write(
++            self._row(
++                "retrieve_process_done",
++                request_id=request_id,
++                worker_id=worker_id,
++                num_chunks=num_chunks,
++                size_gb=f"{size_gb:.6f}",
++                duration_ms=f"{duration_ms:.3f}",
++                async_loading=str(async_loading),
++            )
++        )
++
++    def retrieve_complete(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        hit_tokens: int,
++        total_tokens: int,
++        size_gb: float,
++        duration_ms: float,
++        process_tokens_ms: float,
++        to_gpu_ms: float,
++        broadcast_ms: float,
++    ) -> None:
++        """Entire ``retrieve()`` call finished."""
++        self._write(
++            self._row(
++                "retrieve_complete",
++                request_id=request_id,
++                worker_id=worker_id,
++                hit_tokens=hit_tokens,
++                total_tokens=total_tokens,
++                size_gb=f"{size_gb:.6f}",
++                duration_ms=f"{duration_ms:.3f}",
++                throughput_gbps=self._throughput(size_gb, duration_ms),
++                notes=(
++                    f"process_tokens_ms={process_tokens_ms:.3f} "
++                    f"to_gpu_ms={to_gpu_ms:.3f} "
++                    f"broadcast_ms={broadcast_ms:.3f}"
++                ),
++            )
++        )
++
++    # ── Layer-wise retrieve ──────────────────────────────────────────────
++
++    def retrieve_layer_start(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        num_chunks: int,
++        num_layers: int,
++        location: str,
++        hit_tokens: int,
++    ) -> None:
++        """Layerwise retrieve loop begins."""
++        self._write(
++            self._row(
++                "retrieve_layer_start",
++                request_id=request_id,
++                worker_id=worker_id,
++                num_chunks=num_chunks,
++                num_layers=num_layers,
++                location=location,
++                backend_name=location,
++                hit_tokens=hit_tokens,
++                is_layerwise="True",
++            )
++        )
++
++    def retrieve_layer_get(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        layer_id: int,
++        num_layers: int,
++        location: str,
++        num_chunks: int,
++    ) -> None:
++        """Async get task submitted for one layer."""
++        self._write(
++            self._row(
++                "retrieve_layer_get",
++                request_id=request_id,
++                worker_id=worker_id,
++                layer_id=layer_id,
++                num_layers=num_layers,
++                location=location,
++                backend_name=location,
++                num_chunks=num_chunks,
++                is_layerwise="True",
++            )
++        )
++
++    def retrieve_layer(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        layer_id: int,
++        num_layers: int,
++        num_chunks: int,
++        duration_ms: float,
++    ) -> None:
++        """One layer's data delivered to GPU (CPU→GPU complete)."""
++        self._write(
++            self._row(
++                "retrieve_layer",
++                request_id=request_id,
++                worker_id=worker_id,
++                layer_id=layer_id,
++                num_layers=num_layers,
++                num_chunks=num_chunks,
++                duration_ms=f"{duration_ms:.3f}",
++                is_layerwise="True",
++            )
++        )
++
++    def retrieve_layer_complete(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        hit_tokens: int,
++        total_tokens: int,
++        num_layers: int,
++        duration_ms: float,
++    ) -> None:
++        """All layers of a layerwise retrieve delivered to GPU."""
++        self._write(
++            self._row(
++                "retrieve_layer_complete",
++                request_id=request_id,
++                worker_id=worker_id,
++                hit_tokens=hit_tokens,
++                total_tokens=total_tokens,
++                num_layers=num_layers,
++                duration_ms=f"{duration_ms:.3f}",
++                is_layerwise="True",
++            )
++        )
++
++    # ── Lookup ──────────────────────────────────────────────────────────
++
++    def lookup_complete(
++        self,
++        *,
++        request_id: int,
++        worker_id: int,
++        lookup_id: Optional[str],
++        hit_tokens: int,
++        total_tokens: int,
++        hit_chunks: int,
++        total_chunks: int,
++        is_layerwise: bool,
++        duration_ms: float,
++    ) -> None:
++        """Prefix-length result returned by ``lookup()``."""
++        self._write(
++            self._row(
++                "lookup_complete",
++                request_id=request_id,
++                worker_id=worker_id,
++                lookup_id=lookup_id or "",
++                hit_tokens=hit_tokens,
++                total_tokens=total_tokens,
++                hit_chunks=hit_chunks,
++                num_chunks=total_chunks,
++                is_layerwise=str(is_layerwise),
++                duration_ms=f"{duration_ms:.3f}",
++            )
++        )
++
++    # ── Prefetch ────────────────────────────────────────────────────────
++
++    def prefetch_submit(
++        self,
++        *,
++        lookup_id: str,
++        worker_id: int,
++        num_chunks: int,
++        total_tokens: int,
++        submit_epoch: float,
++    ) -> None:
++        """Async prefetch coroutine submitted to the event loop."""
++        self._write(
++            self._row(
++                "prefetch_submit",
++                lookup_id=lookup_id,
++                worker_id=worker_id,
++                num_chunks=num_chunks,
++                total_tokens=total_tokens,
++                submit_epoch=f"{submit_epoch:.6f}",
++            )
++        )
++
++    def prefetch_backend_contains(
++        self,
++        *,
++        lookup_id: str,
++        worker_id: int,
++        backend_name: str,
++        hit_chunks: int,
++        total_chunks: int,
++    ) -> None:
++        """Result of ``batched_async_contains`` for one backend."""
++        self._write(
++            self._row(
++                "prefetch_backend_contains",
++                lookup_id=lookup_id,
++                worker_id=worker_id,
++                backend_name=backend_name,
++                location=backend_name,
++                hit_chunks=hit_chunks,
++                num_chunks=total_chunks,
++            )
++        )
++
++    def prefetch_backend_done(
++        self,
++        *,
++        lookup_id: str,
++        worker_id: int,
++        backend_name: str,
++        num_chunks: int,
++    ) -> None:
++        """Single-backend loading task finished (callback fired)."""
++        self._write(
++            self._row(
++                "prefetch_backend_done",
++                lookup_id=lookup_id,
++                worker_id=worker_id,
++                backend_name=backend_name,
++                location=backend_name,
++                num_chunks=num_chunks,
++            )
++        )
++
++    def prefetch_tier_result(
++        self,
++        *,
++        lookup_id: str,
++        worker_id: int,
++        tier_idx: int,
++        expected_chunks: int,
++        actual_chunks: int,
++    ) -> None:
++        """Per-tier eviction analysis in ``prefetch_all_done_callback``."""
++        eviction_rate = (
++            1.0 - actual_chunks / expected_chunks if expected_chunks > 0 else 0.0
++        )
++        self._write(
++            self._row(
++                "prefetch_tier_result",
++                lookup_id=lookup_id,
++                worker_id=worker_id,
++                tier_idx=tier_idx,
++                expected_chunks=expected_chunks,
++                actual_chunks=actual_chunks,
++                eviction_rate=f"{eviction_rate:.4f}",
++            )
++        )
++
++    def prefetch_complete(
++        self,
++        *,
++        lookup_id: str,
++        worker_id: int,
++        total_chunks: int,
++        hit_chunks: int,
++        num_tiers: int,
++        submit_epoch: float,
++        done_epoch: float,
++        retrieved_tokens: int,
++    ) -> None:
++        """All prefetch tiers resolved; response sent to scheduler."""
++        duration_ms = (done_epoch - submit_epoch) * 1000 if submit_epoch > 0 else 0.0
++        self._write(
++            self._row(
++                "prefetch_complete",
++                lookup_id=lookup_id,
++                worker_id=worker_id,
++                num_chunks=total_chunks,
++                hit_chunks=hit_chunks,
++                num_layers=num_tiers,
++                hit_tokens=retrieved_tokens,
++                submit_epoch=f"{submit_epoch:.6f}",
++                done_epoch=f"{done_epoch:.6f}",
++                duration_ms=f"{duration_ms:.3f}",
++            )
++        )
+diff --git a/lmcache/v1/cache_engine.py b/lmcache/v1/cache_engine.py
+index 2ae3539..c0d0d31 100644
+--- a/lmcache/v1/cache_engine.py
++++ b/lmcache/v1/cache_engine.py
+@@ -31,6 +31,7 @@ import torch
+ from lmcache.logging import init_logger
+ from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
+ from lmcache.usage_context import InitializeUsageContext
++from lmcache.v1.csv_logger import LMCacheCSVLogger
+ from lmcache.utils import (
+     CacheEngineKey,
+     CacheStoreEvent,
+@@ -402,6 +403,7 @@ class LMCacheEngine:
+         if request_configs is not None and len(request_configs) != 0:
+             assert isinstance(request_configs, dict)
+ 
++        _csv = LMCacheCSVLogger.get()
+         with store_stats.profile_process_tokens():
+             prev_key = 0
+             for start, end, key in self.token_database.process_tokens(
+@@ -433,6 +435,24 @@ class LMCacheEngine:
+                     )
+                     break
+ 
++                chunk_size_gb = memory_obj.get_size() / 1024**3
++                logger.debug(
++                    "[OFFLOAD][CHUNK] chunk_idx=%d tokens=[%d,%d) "
++                    "key_hash=0x%x alloc_size=%.3fMB",
++                    len(memory_objs), start, end,
++                    key.chunk_hash, chunk_size_gb * 1024,
++                )
++                if _csv:
++                    _csv.store_chunk(
++                        request_id=store_stats.request_id,
++                        worker_id=self.metadata.worker_id,
++                        chunk_idx=len(memory_objs),
++                        start_token=start,
++                        end_token=end,
++                        key_hash=key.chunk_hash,
++                        size_gb=chunk_size_gb,
++                    )
++
+                 starts.append(start)
+                 ends.append(end)
+                 keys.append(key)
+@@ -474,8 +494,28 @@ class LMCacheEngine:
+         if not memory_objs:
+             return
+ 
++        logger.debug(
++            "[OFFLOAD] GPU→CPU transfer start: chunks=%d tokens=%d size=%.3fGB",
++            len(memory_objs),
++            tot_token_num,
++            tot_kv_size / 1024**3,
++        )
+         with store_stats.profile_from_gpu():
+             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
++        logger.debug(
++            "[OFFLOAD] GPU→CPU transfer done: from_gpu_time=%.2fms",
++            store_stats.from_gpu_time * 1000,
++        )
++
++        if _csv:
++            _csv.store_gpu_to_cpu_done(
++                request_id=store_stats.request_id,
++                worker_id=self.metadata.worker_id,
++                num_chunks=len(memory_objs),
++                total_tokens=tot_token_num,
++                size_gb=tot_kv_size / 1024**3,
++                duration_ms=store_stats.from_gpu_time * 1000,
++            )
+ 
+         with store_stats.profile_put():
+             transfer_spec = kwargs.get("transfer_spec", None)
+@@ -499,6 +539,19 @@ class LMCacheEngine:
+             store_stats.put_time * 1000,
+         )
+ 
++        if _csv:
++            _csv.store_complete(
++                request_id=store_stats.request_id,
++                worker_id=self.metadata.worker_id,
++                num_chunks=len(memory_objs),
++                total_tokens=tot_token_num,
++                size_gb=tot_kv_size / 1024**3,
++                duration_ms=tot_time * 1000,
++                from_gpu_ms=store_stats.from_gpu_time * 1000,
++                put_ms=store_stats.put_time * 1000,
++                process_tokens_ms=store_stats.process_tokens_time * 1000,
++            )
++
+         self.stats_monitor.on_store_finished(
+             store_stats,
+             tot_token_num,
+@@ -658,6 +711,24 @@ class LMCacheEngine:
+                 ),
+             )
+ 
++            _csv_sl = LMCacheCSVLogger.get()
++            _num_chunks_sl = len(starts)
++            if _csv_sl:
++                _csv_sl.store_layer_start(
++                    request_id=monitor_req_id.request_id,
++                    worker_id=self.metadata.worker_id,
++                    num_chunks=_num_chunks_sl,
++                    num_layers=self.num_layers,
++                    total_tokens=tot_token_num,
++                    size_gb=tot_kv_size / 1024**3,
++                )
++            logger.debug(
++                "[LAYER-STORE] Starting: chunks=%d num_layers=%d tokens=%d "
++                "size=%.3fGB",
++                _num_chunks_sl, self.num_layers, tot_token_num,
++                tot_kv_size / 1024**3,
++            )
++
+             t_start = time.perf_counter()
+             mem_obj_generator = self.gpu_connector.batched_from_gpu(
+                 memory_objs, starts, ends, **kwargs
+@@ -665,10 +736,27 @@ class LMCacheEngine:
+ 
+             next(mem_obj_generator)
+ 
++            _t_layer = time.perf_counter()
+             for layer_id in range(self.num_layers):
+                 yield
+                 next(mem_obj_generator)
+                 self.storage_manager.batched_put(keys[layer_id], memory_objs[layer_id])
++                _t_now = time.perf_counter()
++                _layer_ms = (_t_now - _t_layer) * 1000
++                logger.debug(
++                    "[LAYER-STORE] layer=%d/%d done: layer_time=%.2fms",
++                    layer_id + 1, self.num_layers, _layer_ms,
++                )
++                if _csv_sl:
++                    _csv_sl.store_layer(
++                        request_id=monitor_req_id.request_id,
++                        worker_id=self.metadata.worker_id,
++                        layer_id=layer_id,
++                        num_layers=self.num_layers,
++                        num_chunks=_num_chunks_sl,
++                        duration_ms=_layer_ms,
++                    )
++                _t_layer = _t_now
+ 
+             tot_time = time.perf_counter() - t_start
+             logger.info(
+@@ -680,6 +768,16 @@ class LMCacheEngine:
+                 tot_time * 1000,
+                 tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+             )
++            if _csv_sl:
++                _csv_sl.store_layer_complete(
++                    request_id=monitor_req_id.request_id,
++                    worker_id=self.metadata.worker_id,
++                    num_chunks=_num_chunks_sl,
++                    num_layers=self.num_layers,
++                    total_tokens=tot_token_num,
++                    size_gb=tot_kv_size / 1024**3,
++                    duration_ms=tot_time * 1000,
++                )
+         else:
+             # If no cache are found, we still need to yield to avoid
+             # `StopIteration`
+@@ -746,6 +844,7 @@ class LMCacheEngine:
+ 
+         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+ 
++        _csv_ret = LMCacheCSVLogger.get()
+         reordered_chunks: List[ProcessedChunk] = []
+         if not self._is_passive():
+             with retrieve_stats.profile_process_tokens():
+@@ -754,6 +853,7 @@ class LMCacheEngine:
+                         tokens,
+                         mask,
+                         ret_mask,
++                        _lmcache_request_id=retrieve_stats.request_id,
+                         **kwargs,
+                     )
+                 else:
+@@ -761,8 +861,26 @@ class LMCacheEngine:
+                         tokens,
+                         mask,
+                         ret_mask,
++                        _lmcache_request_id=retrieve_stats.request_id,
+                         **kwargs,
+                     )
++            logger.debug(
++                "[RETRIEVE] Process tokens done: found_chunks=%d size=%.3fGB "
++                "async_loading=%s process_tokens_time=%.2fms",
++                len(reordered_chunks),
++                tot_kv_size / 1024**3,
++                self.async_loading,
++                retrieve_stats.process_tokens_time * 1000,
++            )
++            if _csv_ret:
++                _csv_ret.retrieve_process_done(
++                    request_id=retrieve_stats.request_id,
++                    worker_id=self.metadata.worker_id,
++                    num_chunks=len(reordered_chunks),
++                    size_gb=tot_kv_size / 1024**3,
++                    duration_ms=retrieve_stats.process_tokens_time * 1000,
++                    async_loading=self.async_loading,
++                )
+ 
+         if self.save_only_first_rank:
+             with retrieve_stats.profile_broadcast():
+@@ -807,6 +925,18 @@ class LMCacheEngine:
+             retrieve_stats,
+             retrieved_tokens,
+         )
++        if not self._is_passive() and _csv_ret:
++            _csv_ret.retrieve_complete(
++                request_id=retrieve_stats.request_id,
++                worker_id=self.metadata.worker_id,
++                hit_tokens=int(retrieved_tokens.item()),
++                total_tokens=int(num_required_tokens),
++                size_gb=tot_kv_size / 1024**3,
++                duration_ms=onload_time * 1000,
++                process_tokens_ms=retrieve_stats.process_tokens_time * 1000,
++                to_gpu_ms=retrieve_stats.to_gpu_time * 1000,
++                broadcast_ms=retrieve_stats.broadcast_time * 1000,
++            )
+         # The retrieved may be larger than the need_to_load
+         # Example (page_size=16, chunk_size=256):
+         #
+@@ -920,10 +1050,30 @@ class LMCacheEngine:
+ 
+             ret_mask[start:end] = True
+ 
++        _csv_rl = LMCacheCSVLogger.get()
++        _rl_start = time.perf_counter()
++
+         if keys:
+             # Transpose the keys into layer major format
+             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
+ 
++            _num_chunks_rl = len(starts)
++            _hit_tokens_rl = int(torch.sum(ret_mask).item())
++            logger.debug(
++                "[LAYER-RETRIEVE] Starting: chunks=%d num_layers=%d "
++                "location=%s hit_tokens=%d",
++                _num_chunks_rl, self.num_layers, location, _hit_tokens_rl,
++            )
++            if _csv_rl:
++                _csv_rl.retrieve_layer_start(
++                    request_id=monitor_req_id.request_id,
++                    worker_id=self.metadata.worker_id,
++                    num_chunks=_num_chunks_rl,
++                    num_layers=self.num_layers,
++                    location=location or "",
++                    hit_tokens=_hit_tokens_rl,
++                )
++
+             get_generator = self.storage_manager.layerwise_batched_get(
+                 keys_layer_major,
+                 location=location,
+@@ -941,7 +1091,17 @@ class LMCacheEngine:
+             next(mem_obj_consumer)
+ 
+             to_count_down = []
++            _t_layer = time.perf_counter()
+             for layer_id in range(self.num_layers):
++                if _csv_rl:
++                    _csv_rl.retrieve_layer_get(
++                        request_id=monitor_req_id.request_id,
++                        worker_id=self.metadata.worker_id,
++                        layer_id=layer_id,
++                        num_layers=self.num_layers,
++                        location=location or "",
++                        num_chunks=_num_chunks_rl,
++                    )
+                 task = next(get_generator)
+ 
+                 assert task is not None
+@@ -956,6 +1116,23 @@ class LMCacheEngine:
+                 mem_objs_layer = task.result()
+                 mem_obj_consumer.send(mem_objs_layer)
+                 to_count_down.extend(mem_objs_layer)
++                _t_now = time.perf_counter()
++                _layer_ms = (_t_now - _t_layer) * 1000
++                logger.debug(
++                    "[LAYER-RETRIEVE] layer=%d/%d done: layer_time=%.2fms "
++                    "mem_objs=%d",
++                    layer_id + 1, self.num_layers, _layer_ms, len(mem_objs_layer),
++                )
++                if _csv_rl:
++                    _csv_rl.retrieve_layer(
++                        request_id=monitor_req_id.request_id,
++                        worker_id=self.metadata.worker_id,
++                        layer_id=layer_id,
++                        num_layers=self.num_layers,
++                        num_chunks=len(mem_objs_layer),
++                        duration_ms=_layer_ms,
++                    )
++                _t_layer = _t_now
+ 
+             for mem_obj in to_count_down:
+                 mem_obj.ref_count_down()
+@@ -972,12 +1149,22 @@ class LMCacheEngine:
+ 
+         retrieved_tokens = torch.sum(ret_mask)
+         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
++        _rl_total_ms = (time.perf_counter() - _rl_start) * 1000
+         if not self._is_passive():
+             logger.info(
+                 f"Retrieved {retrieved_tokens} "
+                 f"out of {num_required_tokens} "
+                 f"out of total {len(tokens)} tokens"
+             )
++            if _csv_rl:
++                _csv_rl.retrieve_layer_complete(
++                    request_id=monitor_req_id.request_id,
++                    worker_id=self.metadata.worker_id,
++                    hit_tokens=int(retrieved_tokens.item()),
++                    total_tokens=int(num_required_tokens),
++                    num_layers=self.num_layers,
++                    duration_ms=_rl_total_ms,
++                )
+ 
+         yield ret_mask
+ 
+@@ -1031,6 +1218,9 @@ class LMCacheEngine:
+             assert hashes is not None
+             lookup_stats = self.stats_monitor.on_lookup_request(sum(offsets))
+ 
++        _csv_lk = LMCacheCSVLogger.get()
++        _lk_total_chunks = 0
++        _lk_hit_chunks = 0
+         res = 0
+         try:
+             chunk_info_iterator = self.token_database.process_tokens(
+@@ -1044,6 +1234,7 @@ class LMCacheEngine:
+             if self.use_layerwise:
+                 for start, end, key in chunk_info_iterator:
+                     assert isinstance(key, CacheEngineKey)
++                    _lk_total_chunks += 1
+ 
+                     # TODO(Jiayi): Optimize by checking only the existence of the key
+                     # of one layer
+@@ -1063,6 +1254,7 @@ class LMCacheEngine:
+                             )
+                             location = next(iter(block_mapping.keys()))
+                             self.lookup_pins[lookup_id][location].extend(key_all_layers)
++                        _lk_hit_chunks += 1
+                         res = end
+                         continue
+                     return res
+@@ -1076,10 +1268,18 @@ class LMCacheEngine:
+                     # chunk_info contains (start, end, key)
+                     # chunk_info[2] is the key
+                     keys.append(chunk_info[2])
++                _lk_total_chunks = len(keys)
+                 # hit chunks by prefix matching
+                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
+                     keys, search_range, pin
+                 )
++                logger.debug(
++                    "[LOOKUP][CHUNK] hit_chunks=%d/%d locations=%s",
++                    hit_chunks,
++                    len(keys),
++                    list(block_mapping.keys()),
++                )
++                _lk_hit_chunks = hit_chunks
+                 if pin and block_mapping:
+                     assert lookup_id is not None, (
+                         "lookup_id is required when pin is True"
+@@ -1094,7 +1294,25 @@ class LMCacheEngine:
+             # all tokens where found, return the maximal end
+             return res
+         finally:
++            logger.debug(
++                "[LOOKUP] Finished: hit_tokens=%d use_layerwise=%s lookup_id=%s",
++                res,
++                self.use_layerwise,
++                lookup_id,
++            )
+             self.stats_monitor.on_lookup_finished(lookup_stats, res)
++            if _csv_lk:
++                _csv_lk.lookup_complete(
++                    request_id=lookup_stats.request_id,
++                    worker_id=self.metadata.worker_id,
++                    lookup_id=lookup_id,
++                    hit_tokens=res,
++                    total_tokens=lookup_stats.num_tokens,
++                    hit_chunks=_lk_hit_chunks,
++                    total_chunks=_lk_total_chunks,
++                    is_layerwise=self.use_layerwise,
++                    duration_ms=lookup_stats.time_to_lookup() * 1000,
++                )
+             # vllm lookup sets pin to True
+             if pin:
+                 # touch_cache is tightly coupled with batched_contains
+@@ -1203,9 +1421,26 @@ class LMCacheEngine:
+             keys.append(key)
+             cum_chunk_lengths.append(end)
+ 
++        _submit_epoch = time.time()
++        _csv_pf = LMCacheCSVLogger.get()
++        if _csv_pf:
++            _csv_pf.prefetch_submit(
++                lookup_id=lookup_id,
++                worker_id=self.metadata.worker_id,
++                num_chunks=len(keys),
++                total_tokens=cum_chunk_lengths[-1] if cum_chunk_lengths else 0,
++                submit_epoch=_submit_epoch,
++            )
++        logger.debug(
++            "[PREFETCH] Submitting: lookup_id=%s chunks=%d tokens=%d",
++            lookup_id, len(keys),
++            cum_chunk_lengths[-1] if cum_chunk_lengths else 0,
++        )
++
+         asyncio.run_coroutine_threadsafe(
+             self.storage_manager.async_lookup_and_prefetch(
+-                lookup_id, keys, cum_chunk_lengths, search_range, pin
++                lookup_id, keys, cum_chunk_lengths, search_range, pin,
++                submit_epoch=_submit_epoch,
+             ),
+             self.storage_manager.loop,
+         )
+@@ -1522,6 +1757,7 @@ class LMCacheEngine:
+         tokens,
+         mask,
+         ret_mask,
++        _lmcache_request_id: int = -1,
+         **kwargs,
+     ) -> ProcessTokensInternalResult:
+         """Process tokens and populate the reordered lists.
+@@ -1532,10 +1768,12 @@ class LMCacheEngine:
+             tokens: Input tokens to process
+             mask: Mask indicating valid token positions
+             ret_mask: Output mask updated with cache hit positions
++            _lmcache_request_id: Internal request id for CSV logging
+             **kwargs: Additional keyword arguments
+         """
+         assert self.storage_manager is not None
+ 
++        _csv_pt = LMCacheCSVLogger.get()
+         tot_kv_size = 0
+         reordered_chunks: List[ProcessedChunk] = []
+         request_configs = kwargs.get("request_configs")
+@@ -1550,6 +1788,30 @@ class LMCacheEngine:
+         ):
+             assert isinstance(key, CacheEngineKey)
+             chunk_infos.append((key, start, end))
++            logger.debug(
++                "[RETRIEVE][CHUNK] chunk_idx=%d tokens=[%d,%d) chunk_tokens=%d "
++                "key_hash=0x%x",
++                len(chunk_infos) - 1,
++                start,
++                end,
++                end - start,
++                key.chunk_hash,
++            )
++            if _csv_pt:
++                _csv_pt.retrieve_chunk_discover(
++                    request_id=_lmcache_request_id,
++                    worker_id=self.metadata.worker_id,
++                    chunk_idx=len(chunk_infos) - 1,
++                    start_token=start,
++                    end_token=end,
++                    key_hash=key.chunk_hash,
++                    async_loading=False,
++                )
++
++        logger.debug(
++            "[RETRIEVE] token_database produced %d chunks to look up",
++            len(chunk_infos),
++        )
+ 
+         # block_mapping: location -> [(CacheEngineKey, start, end)]
+         if (
+@@ -1562,13 +1824,34 @@ class LMCacheEngine:
+         else:
+             block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
+ 
++        logger.debug(
++            "[RETRIEVE] block_mapping: %d location(s) -> %s",
++            len(block_mapping),
++            {loc: len(blks) for loc, blks in block_mapping.items()},
++        )
++
+         last_failed_block_start = None
+         for location, blocks in block_mapping.items():
+             keys = [key for key, _, _ in blocks]
++            logger.debug(
++                "[RETRIEVE] batched_get from location='%s' chunks=%d",
++                location,
++                len(keys),
++            )
++            _t_get = time.perf_counter()
+             memory_objs = self.storage_manager.batched_get(
+                 keys=keys,
+                 location=location,
+             )
++            _get_ms = (time.perf_counter() - _t_get) * 1000
++            if _csv_pt:
++                _csv_pt.retrieve_batch_get(
++                    request_id=_lmcache_request_id,
++                    worker_id=self.metadata.worker_id,
++                    location=location,
++                    num_chunks=len(keys),
++                    duration_ms=_get_ms,
++                )
+ 
+             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):
+                 if memory_obj is None:
+diff --git a/lmcache/v1/storage_backend/storage_manager.py b/lmcache/v1/storage_backend/storage_manager.py
+index 15fb1c5..1d5268c 100644
+--- a/lmcache/v1/storage_backend/storage_manager.py
++++ b/lmcache/v1/storage_backend/storage_manager.py
+@@ -23,8 +23,11 @@ import threading
+ import torch
+ 
+ # First Party
++import time as _time
++
+ from lmcache.logging import init_logger
+ from lmcache.observability import PrometheusLogger
++from lmcache.v1.csv_logger import LMCacheCSVLogger
+ from lmcache.utils import (
+     CacheEngineKey,
+     _lmcache_nvtx_annotate,
+@@ -535,9 +538,16 @@ class StorageManager:
+         """
+         if location is None:
+             location = "LocalCPUBackend"
+-        for keys_multi_chunk in keys:
++        for layer_idx, keys_multi_chunk in enumerate(keys):
+             # Retrieve all chunks for one layer
+             backend = self.storage_backends[location]
++            logger.debug(
++                "[LAYER-RETRIEVE] Submitting get: layer=%d/%d chunks=%d location='%s'",
++                layer_idx + 1,
++                len(keys),
++                len(keys_multi_chunk),
++                location,
++            )
+             # TODO(Jiayi): need to make async loading and layerwise compatible
+             coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
+             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+@@ -554,7 +564,19 @@ class StorageManager:
+         (i.e., prefetching from a single backend) is done.
+         """
+         # TODO(Jiayi): support write-back policy here
+-        pass
++        lookup_id = getattr(future, "_lmcache_lookup_id", "")
++        logger.debug(
++            "[PREFETCH] Single backend done: backend=%s chunks=%d lookup_id=%s",
++            backend_name, len(keys), lookup_id,
++        )
++        _csv = LMCacheCSVLogger.get()
++        if _csv:
++            _csv.prefetch_backend_done(
++                lookup_id=lookup_id,
++                worker_id=self.worker_id,
++                backend_name=backend_name,
++                num_chunks=len(keys),
++            )
+ 
+     def prefetch_all_done_callback(
+         self,
+@@ -616,15 +638,38 @@ class StorageManager:
+         #   res = [[obj0, obj1], [obj3, obj4], [obj5, obj6]]
+         #   total_retrieved_chunks = 2 (stop at tier 0, all subsequent ignored)
+         #   retrieved_length = cum_chunk_lengths_total[2] = 512
++        _csv_done = LMCacheCSVLogger.get()
++        _done_epoch = _time.time()
+         total_retrieved_chunks = 0
+         for tier_idx, tier_result in enumerate(res):
+             actual_chunks = len(tier_result)
+             expected_chunks = tier_expected_chunks[tier_idx]
+             total_retrieved_chunks += actual_chunks
+ 
++            logger.debug(
++                "[PREFETCH] Tier %d: expected=%d actual=%d eviction=%s "
++                "lookup_id=%s",
++                tier_idx, expected_chunks, actual_chunks,
++                actual_chunks < expected_chunks, lookup_id,
++            )
++            if _csv_done:
++                _csv_done.prefetch_tier_result(
++                    lookup_id=lookup_id,
++                    worker_id=self.worker_id,
++                    tier_idx=tier_idx,
++                    expected_chunks=expected_chunks,
++                    actual_chunks=actual_chunks,
++                )
++
+             # If a tier retrieved fewer chunks than expected, we stop counting
+             # because subsequent chunks are not contiguous
+             if actual_chunks < expected_chunks:
++                logger.warning(
++                    "[PREFETCH] Eviction in tier %d for lookup_id=%s: "
++                    "expected=%d actual=%d; dropping %d tier(s)",
++                    tier_idx, lookup_id, expected_chunks, actual_chunks,
++                    len(res) - tier_idx - 1,
++                )
+                 # Release all chunks in subsequent tiers since they won't be used
+                 for subsequent_tier in res[tier_idx + 1 :]:
+                     for mem_obj in subsequent_tier:
+@@ -636,6 +681,18 @@ class StorageManager:
+             f"Responding to scheduler for lookup id {lookup_id}"
+             f" with retrieved length {retrieved_length}"
+         )
++        if _csv_done:
++            _submit_epoch = getattr(task, "_lmcache_submit_epoch", 0.0)
++            _csv_done.prefetch_complete(
++                lookup_id=lookup_id,
++                worker_id=self.worker_id,
++                total_chunks=len(cum_chunk_lengths_total) - 1,
++                hit_chunks=total_retrieved_chunks,
++                num_tiers=len(tier_expected_chunks),
++                submit_epoch=_submit_epoch,
++                done_epoch=_done_epoch,
++                retrieved_tokens=retrieved_length,
++            )
+         self.async_lookup_server.send_response_to_scheduler(lookup_id, retrieved_length)
+ 
+     async def async_lookup_and_prefetch(
+@@ -645,6 +702,7 @@ class StorageManager:
+         cum_chunk_lengths: list[int],
+         search_range: Optional[list[str]] = None,
+         pin: bool = False,
++        submit_epoch: float = 0.0,
+     ) -> None:
+         """
+         Perform asynchronous lookup and prefetching across all storage backends.
+@@ -664,6 +722,7 @@ class StorageManager:
+         to search in. Should be a subset of ["LocalCPUBackend",
+         "LocalDiskBackend"] for now. If None, search in all backends.
+         :param bool pin: Whether to pin the keys.
++        :param float submit_epoch: Unix epoch when the prefetch was requested.
+         """
+ 
+         # NOTE(Jiayi): Currently, the retrieval pattern is always
+@@ -697,6 +756,24 @@ class StorageManager:
+         ):
+             num_hit_chunks = await backend.batched_async_contains(lookup_id, keys, pin)
+ 
++            logger.debug(
++                "[PREFETCH] Backend='%s' contains check: hit_chunks=%d/%d "
++                "lookup_id=%s",
++                backend_name,
++                num_hit_chunks,
++                len(keys),
++                lookup_id,
++            )
++            _csv_pf = LMCacheCSVLogger.get()
++            if _csv_pf:
++                _csv_pf.prefetch_backend_contains(
++                    lookup_id=lookup_id,
++                    worker_id=self.worker_id,
++                    backend_name=backend_name,
++                    hit_chunks=num_hit_chunks,
++                    total_chunks=len(keys),
++                )
++
+             if num_hit_chunks == 0:
+                 continue
+ 
+@@ -720,6 +797,7 @@ class StorageManager:
+                 num_hit_chunks,
+             )
+             loading_task = asyncio.create_task(get_coro)
++            loading_task._lmcache_lookup_id = lookup_id  # type: ignore[attr-defined]
+             loading_task.add_done_callback(
+                 functools.partial(
+                     self.prefetch_single_done_callback,
+@@ -738,10 +816,22 @@ class StorageManager:
+ 
+         # If no chunks were hit across all backends, respond immediately and return.
+         if num_total_hit_chunks == 0:
++            logger.debug(
++                "[PREFETCH] No chunks found across all backends for lookup_id=%s",
++                lookup_id,
++            )
+             if self.async_lookup_server is not None:
+                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+             return
+ 
++        logger.debug(
++            "[PREFETCH] Total hit: %d/%d chunks across %d tier(s) for lookup_id=%s",
++            num_total_hit_chunks,
++            num_total_chunks,
++            len(tier_expected_chunks),
++            lookup_id,
++        )
++
+         # gather_with_keys() here make a pair of (key, memory_obj) for each chunk
+         # in each tier. The all_done result's layout is like following and
+         # will be processed in _async_process_tokens_internal()
+@@ -761,6 +851,7 @@ class StorageManager:
+             ]
+ 
+         all_done = asyncio.create_task(gather_with_keys())
++        all_done._lmcache_submit_epoch = submit_epoch  # type: ignore[attr-defined]
+         # Register the event before adding the callback to avoid race conditions
+         self.event_manager.add_event(
+             EventType.LOADING,

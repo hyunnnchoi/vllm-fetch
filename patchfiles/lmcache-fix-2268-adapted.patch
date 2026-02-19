@@ -1,0 +1,134 @@
+diff --git a/lmcache/integration/vllm/vllm_v1_adapter.py b/lmcache/integration/vllm/vllm_v1_adapter.py
+--- a/lmcache/integration/vllm/vllm_v1_adapter.py
++++ b/lmcache/integration/vllm/vllm_v1_adapter.py
+@@ -508,6 +508,9 @@ class LMCacheConnectorV1Impl:
+             Generator[Optional[torch.Tensor], None, None]
+         ] = []
+         self.layerwise_storers: list[Generator[Optional[torch.Tensor], None, None]] = []
++        # NOTE, hyunnnchoi, 2026.02.12 - Track req_ids for layerwise storing
++        # to safely unpin even when connector metadata is empty
++        self._layerwise_store_req_ids: list[str] = []
+         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+ 
+         # Role-specific initialization
+@@ -999,6 +1002,8 @@ class LMCacheConnectorV1Impl:
+         kvcaches = list(self.kv_caches.values())
+         if self.current_layer == 0:
+             self.layerwise_storers = []
++            # NOTE, hyunnnchoi, 2026.02.12 - Reset req_ids tracking for new forward
++            self._layerwise_store_req_ids = []
+ 
+             is_first = True
+ 
+@@ -1055,11 +1060,20 @@ class LMCacheConnectorV1Impl:
+                     req_id=request.req_id,
+                 )
+                 self.layerwise_storers.append(layerwise_storer)
++                # NOTE, hyunnnchoi, 2026.02.12 - Track req_id for safe unpin
++                self._layerwise_store_req_ids.append(request.req_id)
+                 if is_first:
+                     is_first = False
+ 
+         for layerwise_storer in self.layerwise_storers:
+-            next(layerwise_storer)
++            # NOTE, hyunnnchoi, 2026.02.12 - Prevent StopIteration from crashing vLLM
++            # Generator completion should never crash the vLLM engine.
++            try:
++                next(layerwise_storer)
++            except StopIteration:
++                logger.debug(
++                    "Layerwise storer completed early during save_kv_layer; skipping."
++                )
+ 
+         self.current_layer += 1
+ 
+@@ -1075,12 +1089,21 @@ class LMCacheConnectorV1Impl:
+             return
+ 
+         if self.use_layerwise:
++            # NOTE, hyunnnchoi, 2026.02.12 - Drain all remaining steps to guarantee completion
+             for layerwise_storer in self.layerwise_storers:
+-                next(layerwise_storer)
++                for _ in layerwise_storer:
++                    pass
+ 
+-            # unpin the kv caches according to req_id
+-            for request in connector_metadata.requests:
+-                self.lmcache_engine.lookup_unpin(request.req_id)
++            # Prevent double-finalization if wait_for_save() is called twice.
++            self.layerwise_storers = []
++
++            # NOTE, hyunnnchoi, 2026.02.12 - Combine req_ids from metadata and tracked ids
++            # for safe unpin even when connector metadata is empty
++            req_ids = {r.req_id for r in connector_metadata.requests}
++            req_ids.update(self._layerwise_store_req_ids)
++            self._layerwise_store_req_ids = []
++            for req_id in req_ids:
++                self.lmcache_engine.lookup_unpin(req_id)
+             return
+ 
+         assert len(self.kv_caches) > 0
+diff --git a/lmcache/utils.py b/lmcache/utils.py
+--- a/lmcache/utils.py
++++ b/lmcache/utils.py
+@@ -318,13 +318,15 @@ def parse_cache_key(key_str: str) -> Union[CacheEngineKey, LayerCacheEngineKey]:
+ 
+     Args:
+         key_str: String in format:
+-            model_name@world_size@worker_id@chunk_hash[@layer_id][@tag%value...]
++            model_name@world_size@worker_id@chunk_hash@dtype[@layer_id][@tag%value...]
+ 
+     Returns:
+         CacheEngineKey if no layer_id, LayerCacheEngineKey if valid layer_id
+     """
+     parts = key_str.strip().split("@")
+-    if len(parts) >= 5 and parts[4].isdigit():
++    # NOTE, hyunnnchoi, 2026.02.12 - Fix layer-id index after dtype field
++    # parts: [model_name, world_size, worker_id, chunk_hash, dtype, layer_id?, ...]
++    if len(parts) >= 6 and parts[5].isdigit():
+         return LayerCacheEngineKey.from_string(key_str)
+     return CacheEngineKey.from_string(key_str)
+ 
+diff --git a/lmcache/v1/cache_engine.py b/lmcache/v1/cache_engine.py
+--- a/lmcache/v1/cache_engine.py
++++ b/lmcache/v1/cache_engine.py
+@@ -563,9 +563,13 @@ class LMCacheEngine:
+                 "Freeze mode enabled, skipping store_layer for %d tokens",
+                 num_to_store_tokens,
+             )
+-            # Still need to yield to avoid StopIteration
++            # NOTE, hyunnnchoi, 2026.02.12 - Match expected step count in layerwise
++            # integrations (vLLM calls next() once per layer plus one extra
++            # in wait_for_save()).
+             for layer_id in range(self.num_layers):
+                 yield
++            # One extra yield for the "finalize" step.
++            yield
+             return
+ 
+         starts = []
+diff --git a/lmcache/v1/offload_server/zmq_server.py b/lmcache/v1/offload_server/zmq_server.py
+--- a/lmcache/v1/offload_server/zmq_server.py
++++ b/lmcache/v1/offload_server/zmq_server.py
+@@ -25,6 +25,11 @@ class ZMQOffloadServer(OffloadServerInterface):
+         lmcache_engine: LMCacheEngine,
+         tp_rank: int,
+     ):
++        # NOTE, hyunnnchoi, 2026.02.12 - Add logger for ZMQOffloadServer startup info
++        from lmcache.logging import init_logger
++
++        logger = init_logger(__name__)
++
+         metadata = lmcache_engine.metadata
+         self.ctx = get_zmq_context(use_asyncio=False)
+         offload_rpc_port = int(os.environ.get("LMCACHE_OFFLOAD_RPC_PORT", 100))
+@@ -43,6 +48,9 @@ class ZMQOffloadServer(OffloadServerInterface):
+         self.lmcache_engine = lmcache_engine
+         self.running = True
+ 
++        # NOTE, hyunnnchoi, 2026.02.12 - Log ZMQOffloadServer startup for debugging
++        logger.info("Started ZMQOffloadServer (tp_rank=%d) at %s", tp_rank, socket_path)
++
+         def process_request():
+             # First Party
+             from lmcache.logging import init_logger

@@ -1,0 +1,42 @@
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from collections.abc import Iterable, Sequence
+ from typing import Any
+ 
+@@ -27,6 +28,16 @@ from vllm.v1.request import Request
+ 
+ logger = init_logger(__name__)
+ 
++# NOTE, hyunnnchoi, 2026.02.12
++# 환경 변수로 GPU prefix cache hit를 비활성화하는 플래그.
++# VLLM_DISABLE_GPU_PREFIX_CACHE=1 로 설정하면 GPU 메모리의 prefix cache를
++# lookup하지 않고, LMCache 외부 백엔드에서 강제로 KV cache를 retrieve하도록 한다.
++# 이를 통해 KV cache offloading 시 I/O bottleneck을 실증적으로 측정할 수 있다.
++# 주의: KV cache 생성(저장)은 정상 동작하며, retrieve만 GPU를 우회한다.
++_DISABLE_GPU_PREFIX_CACHE = os.environ.get(
++    "VLLM_DISABLE_GPU_PREFIX_CACHE", "0"
++) == "1"
++
+ 
+ class BlockHashToBlockMap:
+     """
+@@ -179,6 +190,14 @@ class BlockPool:
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+     ) -> list[KVCacheBlock] | None:
++        # NOTE, hyunnnchoi, 2026.02.12
++        # GPU prefix cache hit를 비활성화하여 항상 cache miss를 반환.
++        # 이렇게 하면 scheduler가 LMCache 외부 백엔드에서 KV cache를
++        # retrieve하도록 강제할 수 있다. (I/O bottleneck 측정 실험용)
++        if _DISABLE_GPU_PREFIX_CACHE:
++            return None
++
++        # --- Original logic below ---
+         """Get the cached block by the block hash for each group in
+         `kv_cache_group_ids`, or None if cache miss for any group.
+         If there are duplicated blocks, we return the first block in the cache.
